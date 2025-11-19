@@ -1,0 +1,279 @@
+/**
+ * Unsecured Loan Contract
+ * 
+ * A trust-based loan without collateral, using reputation oracles
+ * and social recovery mechanisms.
+ * 
+ * Outcomes:
+ * 1. Repayment: Borrower repays, reputation improves
+ * 2. Default: Borrower defaults, reputation damaged
+ * 3. Dispute: Multi-sig arbitration resolves conflict
+ */
+
+options {
+  server = server;
+  exit = 2016; // 2 weeks exit delay
+}
+
+contract UnsecuredLoan(
+  // Parties
+  pubkey lender,
+  pubkey borrower,
+  pubkey server,
+  pubkey oracleKey,
+  pubkey arbitrator, // Optional third-party arbitrator
+  
+  // Loan terms
+  bytes32 loanTermsHash,
+  bytes32 repaymentOracleId,
+  
+  // Amounts
+  int principalAmount,
+  int interestAmount,
+  
+  // Timing
+  int loanMaturity,
+  int repaymentDeadline
+) {
+  
+  /**
+   * Full Repayment Path
+   * 
+   * Borrower repays principal + interest on time.
+   */
+  function repay(
+    signature borrowerSig,
+    signature lenderSig,
+    bytes oracleAttestation
+  ) {
+    // Verify oracle confirms payment
+    require(
+      verifyRepayment(oracleAttestation, "paid"),
+      "Payment not confirmed"
+    );
+    
+    // Verify both parties sign off
+    require(checkSig(borrowerSig, borrower), "Invalid borrower signature");
+    require(checkSig(lenderSig, lender), "Invalid lender signature");
+    
+    // Funds are already transferred off-chain via oracle verification
+    // This spending path simply closes the VTXO
+  }
+  
+  /**
+   * Partial Repayment Path
+   * 
+   * Borrower repays partial amount, negotiated settlement.
+   */
+  function repayPartial(
+    signature borrowerSig,
+    signature lenderSig,
+    bytes oracleAttestation,
+    int repaidAmount
+  ) {
+    require(
+      verifyRepayment(oracleAttestation, "paid"),
+      "Payment not confirmed"
+    );
+    
+    require(
+      repaidAmount > 0 && repaidAmount < (principalAmount + interestAmount),
+      "Invalid partial amount"
+    );
+    
+    // Both parties must agree to partial settlement
+    require(checkSig(borrowerSig, borrower), "Invalid borrower signature");
+    require(checkSig(lenderSig, lender), "Invalid lender signature");
+  }
+  
+  /**
+   * Default Path
+   * 
+   * Borrower failed to repay by deadline. Lender can trigger default
+   * which damages borrower's on-chain reputation.
+   */
+  function triggerDefault(signature lenderSig) {
+    // Must be past repayment deadline
+    require(
+      tx.time >= repaymentDeadline,
+      "Repayment deadline not reached"
+    );
+    
+    require(checkSig(lenderSig, lender), "Invalid lender signature");
+    
+    // Output 0: Send to reputation contract
+    // This contract records the default on-chain, affecting borrower's credit
+    bytes reputationScript = buildReputationScript(borrower, lender, principalAmount);
+    require(
+      tx.outputs[0].scriptPubKey == reputationScript,
+      "Must record default in reputation contract"
+    );
+  }
+  
+  /**
+   * Dispute Resolution Path
+   * 
+   * If there's a disagreement, arbitrator can resolve.
+   * Requires 2-of-3 signatures: borrower, lender, arbitrator.
+   */
+  function resolveDispute(
+    signature sig1,
+    signature sig2,
+    pubkey signer1,
+    pubkey signer2,
+    bytes resolutionData
+  ) {
+    // Verify we have 2-of-3 valid signatures
+    int validSigs = 0;
+    
+    if (checkSig(sig1, signer1)) {
+      require(
+        signer1 == borrower || signer1 == lender || signer1 == arbitrator,
+        "Invalid signer 1"
+      );
+      validSigs = validSigs + 1;
+    }
+    
+    if (checkSig(sig2, signer2)) {
+      require(
+        signer2 == borrower || signer2 == lender || signer2 == arbitrator,
+        "Invalid signer 2"
+      );
+      require(signer1 != signer2, "Cannot reuse same signer");
+      validSigs = validSigs + 1;
+    }
+    
+    require(validSigs >= 2, "Need 2-of-3 signatures");
+    
+    // Resolution data specifies outcome (encoded as compact struct)
+    // Format: outcometype(1) || borrowerAmount(8) || lenderAmount(8)
+    bytes1 outcomeType = resolutionData.split(1)[0];
+    
+    if (outcomeType == 0x01) {
+      // Resolved in borrower's favor
+      // Funds released back to borrower or debt forgiven
+    } else if (outcomeType == 0x02) {
+      // Resolved in lender's favor
+      // Default recorded, reputation damaged
+    } else if (outcomeType == 0x03) {
+      // Split resolution
+      // Both parties get something
+    }
+  }
+  
+  /**
+   * Extension Path
+   * 
+   * Borrower requests loan extension, lender approves.
+   * Creates a new VTXO with updated terms.
+   */
+  function extendLoan(
+    signature borrowerSig,
+    signature lenderSig,
+    int newDeadline,
+    int additionalInterest
+  ) {
+    require(
+      tx.time < repaymentDeadline,
+      "Cannot extend after deadline"
+    );
+    
+    require(
+      newDeadline > repaymentDeadline,
+      "New deadline must be later"
+    );
+    
+    require(checkSig(borrowerSig, borrower), "Invalid borrower signature");
+    require(checkSig(lenderSig, lender), "Invalid lender signature");
+    
+    // Output 0: New VTXO with updated terms
+    bytes32 newTermsHash = sha256(
+      loanTermsHash || 
+      bytes(newDeadline) || 
+      bytes(additionalInterest)
+    );
+    
+    bytes newContractScript = buildLoanScript(
+      lender,
+      borrower,
+      newTermsHash,
+      newDeadline
+    );
+    
+    require(
+      tx.outputs[0].scriptPubKey == newContractScript,
+      "Must create new loan VTXO"
+    );
+  }
+  
+  /**
+   * Emergency Exit
+   * 
+   * Unilateral exit if server is unavailable.
+   */
+  function emergencyExit(signature partySig, pubkey party) {
+    require(tx.age >= exit, "Exit timelock not satisfied");
+    require(
+      party == borrower || party == lender,
+      "Must be a party to the contract"
+    );
+    require(checkSig(partySig, party), "Invalid signature");
+    
+    // In unsecured loan, no collateral to split
+    // This path just closes the VTXO and records the state
+  }
+  
+  /**
+   * Helper: Verify repayment oracle attestation
+   */
+  function verifyRepayment(bytes attestation, bytes expectedOutcome) returns (bool) {
+    bytes32 attestedEventId = attestation.split(32)[0];
+    bytes outcome = attestation.split(32)[1].split(64)[0];
+    bytes64 signature = attestation.split(32)[1].split(64)[1];
+    
+    if (attestedEventId != repaymentOracleId) return false;
+    if (outcome != expectedOutcome) return false;
+    
+    bytes32 messageHash = sha256(bytes("DLC/oracle/attestation/v0") || outcome);
+    return checkSchnorrSig(signature, oracleKey, messageHash);
+  }
+  
+  /**
+   * Helper: Build reputation contract script
+   */
+  function buildReputationScript(
+    pubkey defaulter,
+    pubkey creditor,
+    int defaultAmount
+  ) returns (bytes) {
+    // Reputation contract receives default record
+    // This is an OP_RETURN output or covenant to reputation registry
+    return new OpReturn(
+      bytes("DEFAULT") ||
+      defaulter ||
+      creditor ||
+      bytes(defaultAmount) ||
+      bytes(tx.time)
+    );
+  }
+  
+  /**
+   * Helper: Build new loan script for extension
+   */
+  function buildLoanScript(
+    pubkey lender,
+    pubkey borrower,
+    bytes32 termsHash,
+    int deadline
+  ) returns (bytes) {
+    // Recursively create the same contract type with new parameters
+    // This allows loan terms to evolve while maintaining structure
+    return new P2TR(
+      internalKey: borrower,
+      scriptTree: [
+        // Recursive covenant maintaining loan structure
+        this.script
+      ]
+    );
+  }
+}

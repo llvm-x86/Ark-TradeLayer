@@ -1,0 +1,253 @@
+/**
+ * Collateralized Loan Contract
+ * 
+ * A VTXO-based loan with Bitcoin collateral and DLC-based liquidation.
+ * 
+ * Parties:
+ * - Lender: Provides the loan principal
+ * - Borrower: Receives principal, provides collateral
+ * - Server: ASP (Ark Service Provider) for cooperative settlement
+ * - Oracle: Provides price attestations for liquidation
+ * 
+ * Outcomes:
+ * 1. Full Repayment: Borrower repays, gets collateral back
+ * 2. Partial Repayment: Pro-rata split of collateral
+ * 3. Liquidation: Collateral value dropped below threshold
+ * 4. Default: Loan term expired without repayment
+ */
+
+// Contract configuration
+options {
+  server = server;
+  exit = 1008; // 1 week exit delay for unilateral path
+}
+
+contract CollateralizedLoan(
+  // Party public keys
+  pubkey lender,
+  pubkey borrower,
+  pubkey server,
+  pubkey oracleKey,
+  
+  // Loan terms (hashed for privacy)
+  bytes32 loanTermsHash,
+  
+  // Oracle event IDs
+  bytes32 repaymentOracleId,
+  bytes32 priceOracleId,
+  
+  // Amounts and thresholds
+  int principalAmount,
+  int collateralAmount,
+  int liquidationThreshold,
+  
+  // Timing
+  int loanMaturity,
+  int gracePeriod
+) {
+  
+  /**
+   * Full Repayment Path
+   * 
+   * Borrower repays the full amount, oracle confirms payment,
+   * borrower receives collateral back.
+   */
+  function repayFull(
+    signature borrowerSig,
+    signature lenderSig,
+    bytes oracleAttestation
+  ) {
+    // Verify oracle attests to full repayment
+    bytes32 attestationHash = sha256(oracleAttestation);
+    require(
+      verifyOracleAttestation(oracleAttestation, repaymentOracleId, "paid"),
+      "Oracle must confirm payment"
+    );
+    
+    // Verify both parties agree
+    require(checkSig(borrowerSig, borrower), "Invalid borrower signature");
+    require(checkSig(lenderSig, lender), "Invalid lender signature");
+    
+    // Output 0: Return collateral to borrower
+    require(
+      tx.outputs[0].value >= collateralAmount,
+      "Must return full collateral"
+    );
+    require(
+      tx.outputs[0].scriptPubKey == new P2TR(borrower),
+      "Collateral must go to borrower"
+    );
+  }
+  
+  /**
+   * Partial Repayment Path
+   * 
+   * Borrower repays partial amount, collateral is split pro-rata.
+   */
+  function repayPartial(
+    signature borrowerSig,
+    signature lenderSig,
+    bytes oracleAttestation,
+    int repaidAmount
+  ) {
+    // Verify payment confirmation
+    require(
+      verifyOracleAttestation(oracleAttestation, repaymentOracleId, "paid"),
+      "Oracle must confirm payment"
+    );
+    
+    // Verify repaid amount is between 0 and principal
+    require(repaidAmount > 0, "Must repay some amount");
+    require(repaidAmount < principalAmount, "Use repayFull for full repayment");
+    
+    // Calculate pro-rata splits
+    int repaymentRatio = (repaidAmount * 1000000) / principalAmount;
+    int lenderShare = (collateralAmount * (1000000 - repaymentRatio)) / 1000000;
+    int borrowerShare = collateralAmount - lenderShare;
+    
+    // Verify signatures
+    require(checkSig(borrowerSig, borrower), "Invalid borrower signature");
+    require(checkSig(lenderSig, lender), "Invalid lender signature");
+    
+    // Output 0: Borrower's share
+    require(
+      tx.outputs[0].value >= borrowerShare,
+      "Incorrect borrower share"
+    );
+    require(
+      tx.outputs[0].scriptPubKey == new P2TR(borrower),
+      "Borrower share must go to borrower"
+    );
+    
+    // Output 1: Lender's share
+    require(
+      tx.outputs[1].value >= lenderShare,
+      "Incorrect lender share"
+    );
+    require(
+      tx.outputs[1].scriptPubKey == new P2TR(lender),
+      "Lender share must go to lender"
+    );
+  }
+  
+  /**
+   * Liquidation Path
+   * 
+   * Collateral value dropped below liquidation threshold.
+   * Lender can claim collateral before maturity.
+   */
+  function liquidate(
+    signature lenderSig,
+    bytes priceAttestation
+  ) {
+    // Verify oracle attests that price hit liquidation threshold
+    require(
+      verifyOracleAttestation(priceAttestation, priceOracleId, "hit"),
+      "Liquidation threshold not reached"
+    );
+    
+    // Verify lender signature
+    require(checkSig(lenderSig, lender), "Invalid lender signature");
+    
+    // Output 0: All collateral to lender
+    require(
+      tx.outputs[0].value >= collateralAmount,
+      "Must transfer full collateral"
+    );
+    require(
+      tx.outputs[0].scriptPubKey == new P2TR(lender),
+      "Collateral must go to lender"
+    );
+  }
+  
+  /**
+   * Default Path
+   * 
+   * Loan matured without repayment. After grace period,
+   * lender can claim collateral.
+   */
+  function claimDefault(signature lenderSig) {
+    // Verify we're past maturity + grace period
+    int defaultTime = loanMaturity + gracePeriod;
+    require(tx.time >= defaultTime, "Grace period not expired");
+    
+    // Verify lender signature
+    require(checkSig(lenderSig, lender), "Invalid lender signature");
+    
+    // Output 0: All collateral to lender
+    require(
+      tx.outputs[0].value >= collateralAmount,
+      "Must transfer full collateral"
+    );
+    require(
+      tx.outputs[0].scriptPubKey == new P2TR(lender),
+      "Collateral must go to lender"
+    );
+  }
+  
+  /**
+   * Borrower Emergency Exit
+   * 
+   * If server is unavailable, borrower can exit unilaterally
+   * after timelock, but loses a penalty.
+   */
+  function emergencyExit(signature borrowerSig) {
+    // Must wait for exit delay (defined in options)
+    require(tx.age >= exit, "Exit timelock not satisfied");
+    
+    // Verify borrower signature
+    require(checkSig(borrowerSig, borrower), "Invalid borrower signature");
+    
+    // Penalty: 10% of collateral goes to lender
+    int penalty = collateralAmount / 10;
+    int borrowerReceives = collateralAmount - penalty;
+    
+    // Output 0: Borrower receives collateral minus penalty
+    require(
+      tx.outputs[0].value >= borrowerReceives,
+      "Incorrect borrower amount"
+    );
+    require(
+      tx.outputs[0].scriptPubKey == new P2TR(borrower),
+      "Must go to borrower"
+    );
+    
+    // Output 1: Penalty to lender
+    require(
+      tx.outputs[1].value >= penalty,
+      "Incorrect penalty amount"
+    );
+    require(
+      tx.outputs[1].scriptPubKey == new P2TR(lender),
+      "Penalty must go to lender"
+    );
+  }
+  
+  /**
+   * Helper: Verify oracle attestation
+   */
+  function verifyOracleAttestation(
+    bytes attestation,
+    bytes32 eventId,
+    bytes expectedOutcome
+  ) returns (bool) {
+    // Parse attestation structure
+    // Format: eventId(32) || outcome(var) || signature(64)
+    bytes32 attestedEventId = attestation.split(32)[0];
+    bytes outcome = attestation.split(32)[1].split(64)[0];
+    bytes64 signature = attestation.split(32)[1].split(64)[1];
+    
+    // Verify event ID matches
+    if (attestedEventId != eventId) return false;
+    
+    // Verify outcome matches expected
+    if (outcome != expectedOutcome) return false;
+    
+    // Verify oracle signature on outcome
+    bytes32 messageHash = sha256(
+      bytes("DLC/oracle/attestation/v0") || outcome
+    );
+    
+    return checkSchnorrSig(signature, oracleKey, messageHash);
+  }
+}
