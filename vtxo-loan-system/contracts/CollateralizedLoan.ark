@@ -36,6 +36,12 @@ contract CollateralizedLoan(
   bytes32 repaymentOracleId,
   bytes32 priceOracleId,
   
+  // Oracle event commitments (v1 attestation format: the descriptor and
+  // maturity are signed alongside the outcome, so the loan must pin them)
+  bytes32 repaymentDescriptorHash,
+  bytes32 priceDescriptorHash,
+  int oracleMaturity,
+  
   // Amounts and thresholds
   int principalAmount,
   int collateralAmount,
@@ -60,7 +66,7 @@ contract CollateralizedLoan(
     // Verify oracle attests to full repayment
     bytes32 attestationHash = sha256(oracleAttestation);
     require(
-      verifyOracleAttestation(oracleAttestation, repaymentOracleId, "paid"),
+      verifyOracleAttestation(oracleAttestation, repaymentOracleId, repaymentDescriptorHash, oracleMaturity, "paid"),
       "Oracle must confirm payment"
     );
     
@@ -92,7 +98,7 @@ contract CollateralizedLoan(
   ) {
     // Verify payment confirmation
     require(
-      verifyOracleAttestation(oracleAttestation, repaymentOracleId, "paid"),
+      verifyOracleAttestation(oracleAttestation, repaymentOracleId, repaymentDescriptorHash, oracleMaturity, "paid"),
       "Oracle must confirm payment"
     );
     
@@ -142,7 +148,7 @@ contract CollateralizedLoan(
   ) {
     // Verify oracle attests that price hit liquidation threshold
     require(
-      verifyOracleAttestation(priceAttestation, priceOracleId, "hit"),
+      verifyOracleAttestation(priceAttestation, priceOracleId, priceDescriptorHash, oracleMaturity, "hit"),
       "Liquidation threshold not reached"
     );
     
@@ -225,27 +231,57 @@ contract CollateralizedLoan(
   
   /**
    * Helper: Verify oracle attestation
+   *
+   * v1 attestation blob format:
+   *   eventId(32) || descriptorHash(32) || maturityTime(8 BE) || outcome(var) || signature(64)
    */
   function verifyOracleAttestation(
     bytes attestation,
     bytes32 eventId,
+    bytes32 expectedDescriptorHash,
+    int expectedMaturity,
     bytes expectedOutcome
   ) returns (bool) {
     // Parse attestation structure
-    // Format: eventId(32) || outcome(var) || signature(64)
     bytes32 attestedEventId = attestation.split(32)[0];
-    bytes outcome = attestation.split(32)[1].split(64)[0];
-    bytes64 signature = attestation.split(32)[1].split(64)[1];
+    bytes32 descriptorHash = attestation.split(32)[1].split(32)[0];
+    bytes maturityTime = attestation.split(32)[1].split(32)[1].split(8)[0];
+    bytes outcome = attestation.split(32)[1].split(32)[1].split(8)[1].split(64)[0];
+    bytes64 signature = attestation.split(32)[1].split(32)[1].split(8)[1].split(64)[1];
     
     // Verify event ID matches
     if (attestedEventId != eventId) return false;
     
+    // The descriptor and maturity are covered by the signature and must match
+    // the terms this loan committed to
+    if (descriptorHash != expectedDescriptorHash) return false;
+    if (maturityTime != uint64be(expectedMaturity)) return false;
+    
     // Verify outcome matches expected
     if (outcome != expectedOutcome) return false;
     
-    // Verify oracle signature on outcome
-    bytes32 messageHash = sha256(
-      bytes("DLC/oracle/attestation/v0") || outcome
+    // Verify oracle signature over the v1 attestation message.
+    //
+    // The on-chain matcher MUST implement the exact same canonical
+    // serialization as the off-chain signer
+    // (vtxo-loan-system/src/attestation/attestation-engine.ts,
+    // serializeAttestationMessage): every field is a 4-byte big-endian length
+    // prefix followed by the field bytes, in this order:
+    //   lenpfx(eventId) || lenpfx(oraclePubkey) || lenpfx(descriptorHash)
+    //   || lenpfx(maturityTime as uint64 BE) || lenpfx(outcome)
+    // and the result is hashed with a BIP-340 tagged hash
+    // (sha256(sha256(tag) || sha256(tag) || msg)) under the tag
+    // "DLC/oracle/attestation/v1".
+    //
+    // NOTE: this replaces the old v0 scheme
+    // sha256("DLC/oracle/attestation/v0" || outcome), which signed only the
+    // outcome string and was therefore replayable across every loan sharing
+    // the oracle key (see issue #1 / C1). Signatures under the v0 tag are
+    // intentionally invalid.
+    bytes32 messageHash = taggedHash(
+      "DLC/oracle/attestation/v1",
+      lenpfx(bytes(attestedEventId)) || lenpfx(bytes(oracleKey))
+        || lenpfx(bytes(descriptorHash)) || lenpfx(maturityTime) || lenpfx(outcome)
     );
     
     return checkSchnorrSig(signature, oracleKey, messageHash);

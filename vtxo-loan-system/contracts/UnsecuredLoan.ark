@@ -27,6 +27,11 @@ contract UnsecuredLoan(
   bytes32 loanTermsHash,
   bytes32 repaymentOracleId,
   
+  // Oracle event commitments (v1 attestation format: the descriptor and
+  // maturity are signed alongside the outcome, so the loan must pin them)
+  bytes32 repaymentDescriptorHash,
+  int repaymentMaturity,
+  
   // Amounts
   int principalAmount,
   int interestAmount,
@@ -48,7 +53,7 @@ contract UnsecuredLoan(
   ) {
     // Verify oracle confirms payment
     require(
-      verifyRepayment(oracleAttestation, "paid"),
+      verifyRepayment(oracleAttestation, repaymentDescriptorHash, repaymentMaturity, "paid"),
       "Payment not confirmed"
     );
     
@@ -72,7 +77,7 @@ contract UnsecuredLoan(
     int repaidAmount
   ) {
     require(
-      verifyRepayment(oracleAttestation, "paid"),
+      verifyRepayment(oracleAttestation, repaymentDescriptorHash, repaymentMaturity, "paid"),
       "Payment not confirmed"
     );
     
@@ -225,16 +230,42 @@ contract UnsecuredLoan(
   
   /**
    * Helper: Verify repayment oracle attestation
+   *
+   * v1 attestation blob format:
+   *   eventId(32) || descriptorHash(32) || maturityTime(8 BE) || outcome(var) || signature(64)
    */
-  function verifyRepayment(bytes attestation, bytes expectedOutcome) returns (bool) {
+  function verifyRepayment(
+    bytes attestation,
+    bytes32 expectedDescriptorHash,
+    int expectedMaturity,
+    bytes expectedOutcome
+  ) returns (bool) {
     bytes32 attestedEventId = attestation.split(32)[0];
-    bytes outcome = attestation.split(32)[1].split(64)[0];
-    bytes64 signature = attestation.split(32)[1].split(64)[1];
+    bytes32 descriptorHash = attestation.split(32)[1].split(32)[0];
+    bytes maturityTime = attestation.split(32)[1].split(32)[1].split(8)[0];
+    bytes outcome = attestation.split(32)[1].split(32)[1].split(8)[1].split(64)[0];
+    bytes64 signature = attestation.split(32)[1].split(32)[1].split(8)[1].split(64)[1];
     
     if (attestedEventId != repaymentOracleId) return false;
+    if (descriptorHash != expectedDescriptorHash) return false;
+    if (maturityTime != uint64be(expectedMaturity)) return false;
     if (outcome != expectedOutcome) return false;
     
-    bytes32 messageHash = sha256(bytes("DLC/oracle/attestation/v0") || outcome);
+    // v1 attestation message — MUST match the off-chain canonical
+    // serialization byte-for-byte (see
+    // vtxo-loan-system/src/attestation/attestation-engine.ts,
+    // serializeAttestationMessage): each field is uint32_be(len) || bytes, in
+    // the order eventId, oraclePubkey, descriptorHash, maturityTime(u64 BE),
+    // outcome, hashed with a BIP-340 tagged hash under
+    // "DLC/oracle/attestation/v1". The v0 scheme
+    // (sha256("DLC/oracle/attestation/v0" || outcome)) signed only the
+    // outcome and was replayable across loans — do not reintroduce it
+    // (see issue #1 / C1).
+    bytes32 messageHash = taggedHash(
+      "DLC/oracle/attestation/v1",
+      lenpfx(bytes(attestedEventId)) || lenpfx(bytes(oracleKey))
+        || lenpfx(bytes(descriptorHash)) || lenpfx(maturityTime) || lenpfx(outcome)
+    );
     return checkSchnorrSig(signature, oracleKey, messageHash);
   }
   

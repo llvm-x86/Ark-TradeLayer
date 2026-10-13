@@ -28,6 +28,12 @@ export interface KeyManagementConfig {
   projectId?: string;
   /** For cloud: secret identifier */
   secretId?: string;
+  /**
+   * Explicit opt-in required to use the "local" key provider outside
+   * development (set ALLOW_LOCAL_KEYS=1). Local mnemonics sitting in the
+   * process environment are not acceptable key custody for real funds.
+   */
+  allowLocalKeys?: boolean;
 }
 
 /**
@@ -159,6 +165,12 @@ export interface SystemConfig {
 }
 
 /**
+ * Insecure placeholder API key shipped in .env.example. Never acceptable
+ * outside development.
+ */
+export const DEFAULT_API_AUTH_KEY = "dev-key-insecure";
+
+/**
  * Loads configuration from environment variables
  */
 export function loadConfigFromEnv(): SystemConfig {
@@ -173,6 +185,7 @@ export function loadConfigFromEnv(): SystemConfig {
     mnemonic: process.env.MNEMONIC,
     projectId: process.env.CLOUD_PROJECT_ID,
     secretId: process.env.CLOUD_SECRET_ID || "oracle-mnemonic",
+    allowLocalKeys: process.env["ALLOW_LOCAL_KEYS"] === "1",
   };
 
   // Database
@@ -215,7 +228,7 @@ export function loadConfigFromEnv(): SystemConfig {
   const api: ApiConfig = {
     publicPort: parseInt(process.env.PUBLIC_API_PORT || "3000"),
     internalPort: parseInt(process.env.INTERNAL_API_PORT || "3001"),
-    authKey: process.env.API_AUTH_KEY || "dev-key-insecure",
+    authKey: process.env.API_AUTH_KEY || DEFAULT_API_AUTH_KEY,
     cors: {
       enabled: process.env.CORS_ENABLED !== "false",
       origins: (process.env.CORS_ORIGINS || "*").split(","),
@@ -277,14 +290,58 @@ export function getBitcoinNetwork(networkType: NetworkType): BitcoinNetwork {
 
 /**
  * Validates configuration
+ *
+ * Security-critical misconfigurations (insecure key custody, default
+ * credentials outside development) are fail-closed: they THROW here instead
+ * of being returned as soft errors that a caller could ignore.
  */
 export function validateConfig(config: SystemConfig): string[] {
   const errors: string[] = [];
+  const critical: string[] = [];
 
   // Validate network
   if (!["mainnet", "testnet", "regtest", "signet"].includes(config.network)) {
     errors.push(`Invalid network: ${config.network}`);
   }
+
+  // --- Fail-closed security checks (C3) ---------------------------------
+  // Insecure key custody must never leave development, and never touch mainnet.
+  const outsideDevelopment =
+    config.mode !== "development" || config.network === "mainnet";
+
+  if (config.keys.provider === "mock" && outsideDevelopment) {
+    critical.push(
+      `KEY_PROVIDER=mock derives keys from a world-known test seed; refusing to run ` +
+        `with mode=${config.mode} network=${config.network}. Use a cloud KMS provider.`
+    );
+  }
+
+  if (
+    config.keys.provider === "local" &&
+    !config.keys.allowLocalKeys &&
+    outsideDevelopment
+  ) {
+    critical.push(
+      `KEY_PROVIDER=local keeps the mnemonic in process memory/env; refusing to run ` +
+        `with mode=${config.mode} network=${config.network}. Set ALLOW_LOCAL_KEYS=1 to ` +
+        `explicitly accept this risk, or use a cloud KMS provider.`
+    );
+  }
+
+  // Default credentials are never acceptable outside development
+  if (config.mode !== "development" && config.api.authKey === DEFAULT_API_AUTH_KEY) {
+    critical.push(
+      `API_AUTH_KEY is the insecure default; refusing to run with mode=${config.mode}. ` +
+        `Set a strong API_AUTH_KEY.`
+    );
+  }
+
+  if (critical.length > 0) {
+    throw new Error(
+      `Fatal configuration errors (refusing to start):\n${critical.join("\n")}`
+    );
+  }
+  // ----------------------------------------------------------------------
 
   // Validate key management
   if (config.keys.provider === "local" && !config.keys.mnemonic) {
@@ -307,11 +364,6 @@ export function validateConfig(config: SystemConfig): string[] {
     errors.push("VTXO_SERVER_PUBKEY is required in non-development mode");
   }
 
-  // Validate API auth in production
-  if (config.mode === "production" && config.api.authKey === "dev-key-insecure") {
-    errors.push("Must set secure API_AUTH_KEY in production mode");
-  }
-
   return errors;
 }
 
@@ -325,6 +377,17 @@ export function loadConfig(): SystemConfig {
   if (errors.length > 0) {
     throw new Error(`Configuration errors:\n${errors.join("\n")}`);
   }
+
+  // Startup log (C3): surface the key custody and the configured trusted
+  // oracle/ASP key so operators can verify what the verifier will pin.
+  console.log(
+    `[config] mode=${config.mode} network=${config.network} keyProvider=${config.keys.provider}`
+  );
+  console.log(
+    `[config] trusted oracle/ASP key (vtxo.serverPublicKey): ${
+      config.vtxo.serverPublicKey || "(unset)"
+    }`
+  );
 
   return config;
 }
