@@ -32,7 +32,9 @@ contract CollateralizedLoan(
   // Loan terms (hashed for privacy)
   bytes32 loanTermsHash,
   
-  // Oracle event IDs
+  // Oracle event IDs - each is sha256(utf8(eventId)) (the canonical 32-byte
+  // event id commitment, see tagged-hash.ts hashEventId); attestation blobs
+  // carry the same value in their leading 32 bytes
   bytes32 repaymentOracleId,
   bytes32 priceOracleId,
   
@@ -233,7 +235,12 @@ contract CollateralizedLoan(
    * Helper: Verify oracle attestation
    *
    * v1 attestation blob format:
-   *   eventId(32) || descriptorHash(32) || maturityTime(8 BE) || outcome(var) || signature(64)
+   *   eventIdHash(32) || descriptorHash(32) || maturityTime(8 BE) || outcome(var) || signature(64)
+   *
+   * where eventIdHash = sha256(utf8(eventId)) - the canonical 32-byte event
+   * id commitment (vtxo-loan-system/src/crypto/tagged-hash.ts, hashEventId).
+   * The loan's pinned `repaymentOracleId` / `priceOracleId` contract
+   * parameters ARE this sha256(utf8(eventId)) value.
    */
   function verifyOracleAttestation(
     bytes attestation,
@@ -249,7 +256,7 @@ contract CollateralizedLoan(
     bytes outcome = attestation.split(32)[1].split(32)[1].split(8)[1].split(64)[0];
     bytes64 signature = attestation.split(32)[1].split(32)[1].split(8)[1].split(64)[1];
     
-    // Verify event ID matches
+    // Verify event ID matches (both sides are sha256(utf8(eventId)))
     if (attestedEventId != eventId) return false;
     
     // The descriptor and maturity are covered by the signature and must match
@@ -267,11 +274,22 @@ contract CollateralizedLoan(
     // (vtxo-loan-system/src/attestation/attestation-engine.ts,
     // serializeAttestationMessage): every field is a 4-byte big-endian length
     // prefix followed by the field bytes, in this order:
-    //   lenpfx(eventId) || lenpfx(oraclePubkey) || lenpfx(descriptorHash)
+    //   lenpfx(eventIdHash) || lenpfx(oraclePubkeyXonly) || lenpfx(descriptorHash)
     //   || lenpfx(maturityTime as uint64 BE) || lenpfx(outcome)
     // and the result is hashed with a BIP-340 tagged hash
     // (sha256(sha256(tag) || sha256(tag) || msg)) under the tag
     // "DLC/oracle/attestation/v1".
+    //
+    // Field encodings (must match byte-for-byte):
+    //   eventIdHash       = attestedEventId, the 32-byte sha256(utf8(eventId))
+    //   oraclePubkeyXonly = xonly(oracleKey), 32 bytes (NOT the 33-byte
+    //                       compressed key)
+    //   descriptorHash    = 32 raw bytes
+    //   maturityTime      = uint64 big-endian, 8 bytes
+    //   outcome           = utf8 bytes of the outcome string (printable ASCII)
+    //
+    // Byte-exact reference vectors both sides must reproduce:
+    //   vtxo-loan-system/tests/vectors/attestation-vectors.json
     //
     // NOTE: this replaces the old v0 scheme
     // sha256("DLC/oracle/attestation/v0" || outcome), which signed only the
@@ -280,10 +298,10 @@ contract CollateralizedLoan(
     // intentionally invalid.
     bytes32 messageHash = taggedHash(
       "DLC/oracle/attestation/v1",
-      lenpfx(bytes(attestedEventId)) || lenpfx(bytes(oracleKey))
+      lenpfx(bytes(attestedEventId)) || lenpfx(bytes(xonly(oracleKey)))
         || lenpfx(bytes(descriptorHash)) || lenpfx(maturityTime) || lenpfx(outcome)
     );
     
-    return checkSchnorrSig(signature, oracleKey, messageHash);
+    return checkSchnorrSig(signature, xonly(oracleKey), messageHash);
   }
 }

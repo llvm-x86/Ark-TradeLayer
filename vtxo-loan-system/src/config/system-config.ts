@@ -170,18 +170,51 @@ export interface SystemConfig {
  */
 export const DEFAULT_API_AUTH_KEY = "dev-key-insecure";
 
+/** Allowlisted key-custody providers */
+export const KEY_PROVIDERS = ["local", "gcp", "aws", "mock"] as const;
+
+/**
+ * Normalizes and validates a KEY_PROVIDER value.
+ *
+ * Strict-comparing the raw environment string ("mock" === provider) was
+ * bypassable with trivial variations - KEY_PROVIDER=Mock, MOCK, " mock" or
+ * any nonsense value silently skipped the fail-closed checks and ran in
+ * production. Values are trimmed + lowercased and must be in the allowlist;
+ * anything else throws, always.
+ */
+export function normalizeKeyProvider(raw: unknown): KeyManagementConfig["provider"] {
+  const normalized = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (!(KEY_PROVIDERS as readonly string[]).includes(normalized)) {
+    throw new Error(
+      `Unrecognized KEY_PROVIDER ${JSON.stringify(raw)}; allowed values: ${KEY_PROVIDERS.join(", ")}`
+    );
+  }
+  return normalized as KeyManagementConfig["provider"];
+}
+
+/** Normalizes a NETWORK value (trim + lowercase) */
+export function normalizeNetwork(raw: unknown): string {
+  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
+}
+
+/** Normalizes an ORACLE_MODE value (trim + lowercase) */
+export function normalizeMode(raw: unknown): string {
+  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
+}
+
 /**
  * Loads configuration from environment variables
  */
 export function loadConfigFromEnv(): SystemConfig {
-  // Network configuration
-  const networkType = (process.env.NETWORK || "regtest") as NetworkType;
-  const mode = (process.env.ORACLE_MODE || "development") as OracleMode;
+  // Network configuration (normalized so e.g. NETWORK=Mainnet cannot dodge
+  // the mainnet-implied production checks below)
+  const networkType = normalizeNetwork(process.env.NETWORK || "regtest") as NetworkType;
+  const mode = normalizeMode(process.env.ORACLE_MODE || "development") as OracleMode;
 
-  // Key management
-  const keyProvider = process.env.KEY_PROVIDER || "mock";
+  // Key management (normalized + allowlisted; throws on anything else)
+  const keyProvider = normalizeKeyProvider(process.env.KEY_PROVIDER || "mock");
   const keys: KeyManagementConfig = {
-    provider: keyProvider as any,
+    provider: keyProvider,
     mnemonic: process.env.MNEMONIC,
     projectId: process.env.CLOUD_PROJECT_ID,
     secretId: process.env.CLOUD_SECRET_ID || "oracle-mnemonic",
@@ -304,35 +337,58 @@ export function validateConfig(config: SystemConfig): string[] {
     errors.push(`Invalid network: ${config.network}`);
   }
 
+  // Validate mode
+  if (!["development", "staging", "production"].includes(config.mode)) {
+    errors.push(`Invalid oracle mode: ${config.mode}`);
+  }
+
   // --- Fail-closed security checks (C3) ---------------------------------
   // Insecure key custody must never leave development, and never touch mainnet.
+  // MAINNET ALWAYS IMPLIES OUTSIDE-DEVELOPMENT: production semantics cannot
+  // be weakened by setting ORACLE_MODE=development against a mainnet network.
   const outsideDevelopment =
     config.mode !== "development" || config.network === "mainnet";
 
-  if (config.keys.provider === "mock" && outsideDevelopment) {
+  // The provider must normalize into the allowlist; casing/padding games
+  // (KEY_PROVIDER=Mock, MOCK, " mock") and typos are fatal, always.
+  let provider: KeyManagementConfig["provider"] | undefined;
+  try {
+    provider = normalizeKeyProvider(config.keys.provider);
+  } catch (e) {
+    critical.push(e instanceof Error ? e.message : String(e));
+  }
+
+  if (provider === "mock" && outsideDevelopment) {
     critical.push(
       `KEY_PROVIDER=mock derives keys from a world-known test seed; refusing to run ` +
         `with mode=${config.mode} network=${config.network}. Use a cloud KMS provider.`
     );
   }
 
-  if (
-    config.keys.provider === "local" &&
-    !config.keys.allowLocalKeys &&
-    outsideDevelopment
-  ) {
-    critical.push(
-      `KEY_PROVIDER=local keeps the mnemonic in process memory/env; refusing to run ` +
-        `with mode=${config.mode} network=${config.network}. Set ALLOW_LOCAL_KEYS=1 to ` +
-        `explicitly accept this risk, or use a cloud KMS provider.`
-    );
+  if (provider === "local") {
+    if (config.network === "mainnet") {
+      // No opt-out on mainnet: a mnemonic in process memory/env is not key
+      // custody for real funds, not even with ALLOW_LOCAL_KEYS=1.
+      critical.push(
+        `KEY_PROVIDER=local keeps the mnemonic in process memory/env; refusing to run ` +
+          `with network=mainnet (ALLOW_LOCAL_KEYS=1 does not apply on mainnet). Use a ` +
+          `cloud KMS provider.`
+      );
+    } else if (!config.keys.allowLocalKeys && outsideDevelopment) {
+      critical.push(
+        `KEY_PROVIDER=local keeps the mnemonic in process memory/env; refusing to run ` +
+          `with mode=${config.mode} network=${config.network}. Set ALLOW_LOCAL_KEYS=1 to ` +
+          `explicitly accept this risk, or use a cloud KMS provider.`
+      );
+    }
   }
 
-  // Default credentials are never acceptable outside development
-  if (config.mode !== "development" && config.api.authKey === DEFAULT_API_AUTH_KEY) {
+  // Default credentials are never acceptable outside development (and
+  // mainnet implies outside development)
+  if (outsideDevelopment && config.api.authKey === DEFAULT_API_AUTH_KEY) {
     critical.push(
-      `API_AUTH_KEY is the insecure default; refusing to run with mode=${config.mode}. ` +
-        `Set a strong API_AUTH_KEY.`
+      `API_AUTH_KEY is the insecure default; refusing to run with mode=${config.mode} ` +
+        `network=${config.network}. Set a strong API_AUTH_KEY.`
     );
   }
 
@@ -344,11 +400,11 @@ export function validateConfig(config: SystemConfig): string[] {
   // ----------------------------------------------------------------------
 
   // Validate key management
-  if (config.keys.provider === "local" && !config.keys.mnemonic) {
+  if (provider === "local" && !config.keys.mnemonic) {
     errors.push("Local key provider requires MNEMONIC environment variable");
   }
 
-  if (["gcp", "aws"].includes(config.keys.provider)) {
+  if (provider === "gcp" || provider === "aws") {
     if (!config.keys.projectId) {
       errors.push(`Cloud provider requires CLOUD_PROJECT_ID`);
     }

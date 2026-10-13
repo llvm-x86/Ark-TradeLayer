@@ -318,12 +318,21 @@ CLOUD_SECRET_ID=oracle-master-key
 The system uses **deterministic nonce derivation** to prevent nonce reuse:
 
 ```
-k = privkey_base + H_tag("DLC/oracle/nonce/v0", R_base || eventId)
+eventIdHash = sha256(utf8(eventId))                  // printable-ASCII event ids
+index       = H_tag("DLC/oracle/nonce-index/v1", lenpfx(eventIdHash) || be32(i)) mod 2^31
+nonce_key   = BIP32(m/585'/coin'/0'/0'/index')
+k           = nonce_key + H_tag("DLC/oracle/nonce-tweak/v1", lenpfx(R_base) || lenpfx(eventIdHash))
 ```
 
 - Each event has unique nonces
 - Nonces are reproducible for signing
-- No nonce is ever reused across events
+- The derivation-index hash and the nonce tweak use **separate domain tags**
+- A **used-nonce registry** (`src/attestation/used-nonce-registry.ts`) is the
+  fail-closed backstop: single-writer for the process lifetime, durable
+  append-only history with a digest chain, and refusal to run on an
+  in-memory-only registry outside development. Reusing a `k` across two
+  messages leaks the oracle key (`x = (s1 - s2) / (e1 - e2)`), so a second
+  writer or a deleted/truncated history is fatal at startup, never a warning.
 
 ### Oracle Trust
 

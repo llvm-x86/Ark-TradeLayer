@@ -35,7 +35,7 @@ function getOrComputeTagHash(tag: string | Buffer): Buffer {
  * This provides domain separation, ensuring that hashes for different
  * purposes cannot collide even with the same input data.
  * 
- * @param tag - Domain separation tag (e.g., "DLC/oracle/nonce/v0")
+ * @param tag - Domain separation tag (e.g., "DLC/oracle/nonce-index/v1")
  * @param data - Data to hash
  * @returns 32-byte tagged hash
  */
@@ -52,12 +52,19 @@ export function createTaggedHash(tag: string | Buffer, data: Buffer): Buffer {
  * messages were redefined as canonical length-prefixed commitments that bind
  * the eventId (see attestation-engine.ts). Signatures produced under the old
  * v0 tags are intentionally no longer valid.
+ *
+ * The nonce derivation index and the nonce tweak previously shared the single
+ * tag "DLC/oracle/nonce/v0". Two different derivations under one tag is a
+ * domain-separation failure: any relation between the index hash and the
+ * tweak hash would be usable across derivations. They now have dedicated,
+ * disjoint tags.
  */
 export const DLC_TAGS = {
   ORACLE_ANNOUNCEMENT: "DLC/oracle/announcement/v1",
   ORACLE_ATTESTATION: "DLC/oracle/attestation/v1",
   ORACLE_DESCRIPTOR: "DLC/oracle/descriptor/v1",
-  ORACLE_NONCE: "DLC/oracle/nonce/v0",
+  ORACLE_NONCE_INDEX: "DLC/oracle/nonce-index/v1",
+  ORACLE_NONCE_TWEAK: "DLC/oracle/nonce-tweak/v1",
   CONTRACT_INFO: "DLC/contract/info/v0",
   FUNDING_INPUT: "DLC/funding/input/v0",
 } as const;
@@ -95,6 +102,48 @@ export function encodeUint64BE(value: number): Buffer {
 }
 
 /**
+ * Asserts that a string is printable ASCII (0x20-0x7E) and within the
+ * allowed length.
+ *
+ * JavaScript strings are UTF-16 and `Buffer.from(s, "utf8")` maps every
+ * unpaired surrogate (e.g. "\uD800") onto the U+FFFD replacement character.
+ * Two distinct event ids would therefore serialize - and hash - to identical
+ * bytes, letting one event's attestation collide with another's. Restricting
+ * event ids (and outcome labels) to printable ASCII removes the collision
+ * class entirely.
+ */
+export function assertPrintableAscii(text: string, what: string): void {
+  if (typeof text !== "string" || text.length === 0 || text.length > 255) {
+    throw new Error(`${what} must be a 1..255 character string`);
+  }
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x20 || code > 0x7e) {
+      throw new Error(
+        `${what} must be printable ASCII (0x20-0x7E); got non-ASCII/control ` +
+          `character U+${code.toString(16).toUpperCase().padStart(4, "0")} at index ${i}`
+      );
+    }
+  }
+}
+
+/**
+ * Canonical 32-byte event id commitment: sha256(utf8(eventId)).
+ *
+ * This is THE eventId on every hashed/signed path (attestation message,
+ * announcement message, nonce derivation index, nonce tweak) and the value
+ * the on-chain matcher compares against its pinned `bytes32 eventId` (the
+ * .ark contracts call it `repaymentOracleId` / `priceOracleId`). Both sides
+ * MUST use these 32 raw bytes - hashing the utf8 string on one side and the
+ * bytes32 on the other produced two incompatible serializations (see the
+ * shared test vectors in tests/vectors/attestation-vectors.json).
+ */
+export function hashEventId(eventId: string): Buffer {
+  assertPrintableAscii(eventId, "eventId");
+  return sha256(Buffer.from(eventId, "utf8"));
+}
+
+/**
  * Creates announcement hash for oracle event pre-commitment
  *
  * @param announcementData - canonical length-prefixed announcement serialization
@@ -124,12 +173,17 @@ export function hashAttestation(message: Buffer): Buffer {
  * so distinct (basePoint, eventId) tuples could serialize to the same bytes
  * and derive the same tweak - and therefore the same signing nonce k).
  *
+ * The eventId is folded in as its 32-byte sha256(utf8(eventId)) commitment
+ * (hashEventId), the same id the signed messages bind, and the tweak has a
+ * dedicated tag disjoint from the nonce-derivation-index hash
+ * (DLC_TAGS.ORACLE_NONCE_INDEX).
+ *
  * @param basePoint - Base public point (typically the derived nonce point)
- * @param eventId - Unique event identifier
+ * @param eventId - Unique event identifier (printable ASCII)
  */
 export function deriveNonceTweak(basePoint: Buffer, eventId: string): Buffer {
-  const combined = concatLengthPrefixed([basePoint, Buffer.from(eventId, "utf8")]);
-  return createTaggedHash(DLC_TAGS.ORACLE_NONCE, combined);
+  const combined = concatLengthPrefixed([basePoint, hashEventId(eventId)]);
+  return createTaggedHash(DLC_TAGS.ORACLE_NONCE_TWEAK, combined);
 }
 
 /**
