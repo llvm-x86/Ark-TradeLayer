@@ -1,5 +1,5 @@
 {
-  "$comment": "SHARED test vectors: vtxo-loan-system TypeScript signer AND the .ark on-chain matchers (CollateralizedLoan.ark / UnsecuredLoan.ark) must reproduce these bytes exactly. Field encodings: eventIdHash = sha256(utf8(eventId)); oraclePublicKey is the 32-byte x-only key; each attestation message = lenpfx(eventIdHash) || lenpfx(oracleKeyX) || lenpfx(descriptorHash) || lenpfx(maturityTime u64 BE) || lenpfx(outcome utf8) hashed under BIP-340 tag 'DLC/oracle/attestation/v1'. Signatures are standard BIP-340 over the message hash. The private key here is TEST-ONLY (published on purpose, like the BIP-340 test vectors).",
+  "$comment": "SHARED test vectors: vtxo-loan-system TypeScript signer AND the .ark on-chain matchers (CollateralizedLoan.ark / UnsecuredLoan.ark) must reproduce these bytes exactly. Field encodings: eventIdHash = sha256(utf8(eventId)); oraclePublicKey is the 32-byte x-only key; lenpfx(x) = 4-byte big-endian length of x followed by x (the .ark builtin encoding); each attestation message = lenpfx(eventIdHash) || lenpfx(oracleKeyX) || lenpfx(descriptorHash) || lenpfx(maturityTime u64 BE) || lenpfx(outcome utf8) hashed under BIP-340 tag 'DLC/oracle/attestation/v1'. Signatures are standard BIP-340 over the message hash. The private key here is TEST-ONLY (published on purpose, like the BIP-340 test vectors).",
   "version": 1,
   "network": "bitcoin_regtest",
   "keyDerivation": {
@@ -8,6 +8,13 @@
     "noncePurpose": 585
   },
   "maturityTime": 1767225600,
+  "refusals": [
+    {
+      "name": "empty eventId",
+      "eventId": "",
+      "expect": "refused"
+    }
+  ],
   "vectors": [
     {
       "name": "numeric-signed-decimal",

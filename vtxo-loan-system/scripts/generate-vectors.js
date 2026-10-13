@@ -196,7 +196,8 @@ async function main() {
       "on-chain matchers (CollateralizedLoan.ark / UnsecuredLoan.ark) must " +
       "reproduce these bytes exactly. Field encodings: eventIdHash = " +
       "sha256(utf8(eventId)); oraclePublicKey is the 32-byte x-only key; " +
-      "each attestation message = lenpfx(eventIdHash) || lenpfx(oracleKeyX) " +
+      "lenpfx(x) = 4-byte big-endian length of x followed by x (the .ark " +
+      "builtin encoding); each attestation message = lenpfx(eventIdHash) || lenpfx(oracleKeyX) " +
       "|| lenpfx(descriptorHash) || lenpfx(maturityTime u64 BE) || " +
       "lenpfx(outcome utf8) hashed under BIP-340 tag " +
       "'DLC/oracle/attestation/v1'. Signatures are standard BIP-340 over the " +
@@ -210,6 +211,10 @@ async function main() {
       noncePurpose: 585,
     },
     maturityTime: MATURITY_TIME,
+    // Inputs both sides must REFUSE (no eventIdHash, message or signature may be produced)
+    refusals: [
+      { name: "empty eventId", eventId: "", expect: "refused" },
+    ],
     vectors,
   };
 
