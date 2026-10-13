@@ -264,7 +264,7 @@ async function main() {
       // (a) in-process second instance
       expectThrow(
         () => new UsedNonceRegistry({ persistPath: registryPath }),
-        /locked by live process/,
+        /is locked/,
         "second in-process registry was not refused"
       );
 
@@ -284,14 +284,21 @@ async function main() {
 
   // ------------------------------------------------------------------ P4
   await probe("P4  nonce history survives crashes/restarts and cannot be reset", () => {
-    // (a) crash-style exit leaves lock + history; restart keeps it and still
-    // refuses reuse
+    // (a) crash-style exit leaves the lock behind. The stale lock blocks
+    // startup (never taken over); once the operator removes it, history
+    // survives and reuse is still refused
     const crashPath = tmpRegistry();
     const out = execFileSync(process.execPath, [CHILD, crashPath, "record"], {
       cwd: ROOT,
       encoding: "utf8",
     });
     assert(/RECORDED/.test(out), "child did not record");
+    expectThrow(
+      () => new UsedNonceRegistry({ persistPath: crashPath }),
+      /is locked/,
+      "stale lock from a crashed writer was taken over"
+    );
+    fs.unlinkSync(`${crashPath}.lock`);
 
     const restarted = new UsedNonceRegistry({ persistPath: crashPath });
     assert(restarted.get("aa".repeat(32)) !== undefined, "history lost across restart");
@@ -305,6 +312,7 @@ async function main() {
     // (b) tail truncation is detected against the lockfile's history anchor
     const truncatePath = tmpRegistry();
     execFileSync(process.execPath, [CHILD, truncatePath, "record"], { cwd: ROOT });
+    fs.unlinkSync(`${truncatePath}.lock`); // operator clears the crashed writer's lock
     const truncatable = new UsedNonceRegistry({ persistPath: truncatePath });
     truncatable.close();
     const truncated = JSON.parse(fs.readFileSync(truncatePath, "utf8"));
@@ -312,17 +320,18 @@ async function main() {
     fs.writeFileSync(truncatePath, JSON.stringify(truncated));
     expectThrow(
       () => new UsedNonceRegistry({ persistPath: truncatePath }),
-      /disagree about the nonce history tip/,
+      /does not extend the anchored history tip/,
       "tail truncation was not detected"
     );
 
-    // (c) deletion behind the lock is detected
+    // (c) deletion of the registry behind its anchor is detected
     const deletePath = tmpRegistry();
     execFileSync(process.execPath, [CHILD, deletePath, "record"], { cwd: ROOT });
+    fs.unlinkSync(`${deletePath}.lock`);
     fs.unlinkSync(deletePath);
     expectThrow(
       () => new UsedNonceRegistry({ persistPath: deletePath }),
-      /deleted while the registry was locked/,
+      /is missing but its history anchor records tip/,
       "registry deletion was not detected"
     );
 
@@ -330,7 +339,7 @@ async function main() {
     // truncated history cannot be laundered into service
     expectThrow(
       () => new UsedNonceRegistry({ persistPath: truncatePath }),
-      /disagree about the nonce history tip/,
+      /does not extend the anchored history tip/,
       "tampered registry came back into service"
     );
   });

@@ -14,34 +14,67 @@
  * Reuse for a DIFFERENT eventId - or for a different message under the same
  * eventId - is refused.
  *
- * Fail-closed storage design (this registry is the last line of defense
- * against oracle key recovery, so every failure mode refuses to sign):
+ * Guarantees, each enforced by the named function:
  *
- * 1. SINGLE WRITER FOR PROCESS LIFETIME. An O_EXCL lockfile next to the
- *    registry is taken at construction and held until close(). A second
- *    registry instance - in this process or any other - that opens the same
- *    file FAILS AT STARTUP with NonceRegistryLockError. Previously each
- *    instance kept its own in-memory map and rewrote the whole file on save,
- *    so two instances on one file both accepted the same nonce and the second
- *    save() erased the first's record: two signatures with the same k, i.e.
- *    oracle key recovery. A lock owned by a live process is never taken over;
- *    a lock whose owner died is taken over once, carrying its history digest
- *    forward (see 3).
+ * 1. ONE WRITER PER REGISTRY FILE (acquireLock). The registry path is
+ *    canonicalized with realpath BEFORE the lock path `<registry>.lock` is
+ *    derived, so symlinked and parent-directory spellings of one file share one
+ *    lock. The lock is an O_EXCL create taken once, in the constructor, and held
+ *    through an open file descriptor until close(). A second instance - in this
+ *    process or another - fails at construction. Before every write the lock is
+ *    re-verified by inode identity (assertLockHeld: fstat of the held descriptor
+ *    against lstat of the lock path); the descriptor is kept open so that the
+ *    inode number cannot be recycled while this instance holds it.
  *
- * 2. DURABLE ATOMIC WRITES. Every save writes a temporary file, fsyncs it,
- *    renames()s it over the registry and fsyncs the directory. A crash can
- *    never leave a torn or empty registry behind.
+ * 2. NO AUTOMATIC TAKEOVER. This code never reclaims an existing lock, whatever
+ *    it contains (pid, hostname, age). Node exposes no kernel file lock
+ *    (flock/fcntl) in its standard library, and pid, hostname or mtime checks
+ *    cannot prove that a writer is dead, so any automatic reclaim races with a
+ *    live writer. A lock left by a crashed process therefore blocks startup until
+ *    an operator confirms that no process uses the registry and removes the lock
+ *    file. The error message says exactly that. Recovery does not lose history:
+ *    once the lock is cleared, the anchor (guarantee 4) is checked on every start.
  *
- * 3. HISTORY CANNOT BE RESET BY DELETION. The registry is an append-only log
- *    of records chained by digest: entry[i].chain = sha256(entry[i-1].chain ||
- *    sha256(entry[i])). Truncating, reordering or rewriting entries breaks
- *    the chain and the registry refuses to load. The lockfile additionally
- *    carries the chain tip: if the registry file disappears while the
- *    lockfile still records history, startup fails ("history destroyed")
- *    instead of silently starting from scratch - which would allow every
- *    previously used nonce to be used again.
+ * 3. ALIASING IS REFUSED (assertSingleLink). The registry must be a regular file
+ *    with exactly one hard link. A second hard link would give the other name a
+ *    stale copy and a second, independent lock path. Checked on load and again
+ *    before each commit. A symlink that resolves to the registry is handled by
+ *    guarantee 1.
  *
- * 4. NO IN-MEMORY-ONLY MODE OUTSIDE DEVELOPMENT. `persistPath: null` is only
+ * 4. HISTORY IS A CHAINED LOG WITH AN ANCHOR (readVerifiedLog, load). Records are
+ *    appended to a digest chain: chain[i] = sha256(chain[i-1] || sha256(nonceId
+ *    || eventId || messageHash)). The anchor file `<registry>.anchor` records the
+ *    chain tip last committed. On start, the anchor must equal the tip of the
+ *    verified log, or be a strict prefix of it. A strict extension means the
+ *    process stopped after committing the log and before updating the anchor;
+ *    the extension is accepted and the anchor is advanced. A log that is shorter
+ *    than the anchor, or diverges from it, is refused. A registry whose anchor is
+ *    missing while the log has records is also refused.
+ *
+ * 5. DURABLE COMMITS (replaceFileDurably). The log is committed by writing a
+ *    temporary file, fsyncing it, renaming it over the registry, and fsyncing the
+ *    directory. The commit happens BEFORE the caller gets a success result, so a
+ *    nonce is never signed unless its record is durable. Any failure, including
+ *    a failed directory fsync, is raised. A failed commit leaves the registry
+ *    marked uncommitted, and every later attempt to reuse a record re-commits
+ *    first.
+ *
+ * LIMITS (not enforced here):
+ *  - The anchor is unkeyed. Whoever can write the registry directory can rewrite
+ *    the log and the anchor together, or delete both, and reset the history. The
+ *    anchor only detects truncation that leaves it in place. Mitigation is
+ *    operational: restrict the directory to the signer, and back up the anchor.
+ *  - The anchor is written after the log, so a crash between the two leaves an
+ *    anchor one commit behind. Until the next start advances it, truncating
+ *    exactly that last commit is indistinguishable from a crash. This needs
+ *    write access to the registry directory, which the limit above already
+ *    covers.
+ *  - Durability relies on POSIX rename and directory fsync semantics. Platforms
+ *    where the directory cannot be fsynced cannot host a registry.
+ *  - Upgrading from a version with no anchor file: the start is refused. The
+ *    error message gives the anchor format to create by hand from the log tip.
+ *
+ * 6. NO IN-MEMORY-ONLY MODE OUTSIDE DEVELOPMENT. `persistPath: null` is only
  *    accepted with an explicit `allowInMemory: true` opt-in (the attestation
  *    engine only grants it in development mode on non-mainnet networks).
  */
@@ -54,8 +87,13 @@ import * as path from "path";
 /** Default on-disk location of the used-nonce registry */
 export const DEFAULT_NONCE_REGISTRY_PATH = "data/used-nonces.json";
 
-/** Chain seed of the append-only log (chain of the zeroth entry) */
-const GENESIS_DIGEST = Buffer.alloc(32).toString("hex");
+/** Version of the persisted log format */
+const LOG_FORMAT_VERSION = 2;
+/** Version of the anchor file format */
+const ANCHOR_FORMAT_VERSION = 1;
+/** Chain seed of the append-only log (the "previous chain" of entry 0) */
+const GENESIS_DIGEST = "0".repeat(64);
+const HEX_DIGEST = /^[0-9a-f]{64}$/;
 
 /** A recorded nonce usage */
 export interface NonceRecord {
@@ -101,21 +139,18 @@ interface PersistedShape {
   entries: LogEntry[];
 }
 
-/** Contents of the single-writer lockfile */
-interface LockInfo {
-  pid: number;
-  hostname: string;
-  acquiredAt: string;
-  /** Random per-acquisition token; proves the lock file is still ours */
-  token: string;
-  /** Chain tip of the log when the lock was last touched (null = no history) */
-  historyDigest: string | null;
-  /**
-   * Set by close(): the writer released the lock but the record (and its
-   * history digest) is kept as the external anchor that lets tail truncation
-   * of the log be detected on the next startup.
-   */
-  released?: boolean;
+interface AnchorShape {
+  version: number;
+  /** Chain tip last committed; null = the empty history */
+  tip: string | null;
+}
+
+/** The single-writer lock held by this instance. The open descriptor pins the inode. */
+interface HeldLock {
+  readonly lockPath: string;
+  readonly fd: number;
+  readonly dev: bigint;
+  readonly ino: bigint;
 }
 
 export interface UsedNonceRegistryOptions {
@@ -140,14 +175,18 @@ export class UsedNonceRegistry {
   private readonly entries: Map<string, NonceRecord> = new Map();
   /** Append-only persisted log (same order as insertion) */
   private readonly log: LogEntry[] = [];
-  private readonly persistPath: string | null;
-  private lockToken: string | null = null;
+  /** Canonical (realpath) registry path; null in in-memory mode */
+  private readonly registryPath: string | null;
+  private readonly anchorPath: string | null;
+  private lock: HeldLock | null = null;
+  /** True while in-memory records may not yet be durably committed */
+  private uncommitted = false;
 
   constructor(options: UsedNonceRegistryOptions = {}) {
-    const persistPath =
+    const requested =
       options.persistPath === undefined ? DEFAULT_NONCE_REGISTRY_PATH : options.persistPath;
 
-    if (persistPath === null) {
+    if (requested === null) {
       if (options.allowInMemory !== true) {
         throw new NonceRegistryLockError(
           "UsedNonceRegistry: in-memory-only operation (persistPath: null) is refused outside " +
@@ -156,31 +195,37 @@ export class UsedNonceRegistry {
             "path, or explicitly opt in with allowInMemory in development."
         );
       }
-      this.persistPath = null;
+      this.registryPath = null;
+      this.anchorPath = null;
       return;
     }
 
-    this.persistPath = persistPath;
-    fs.mkdirSync(path.dirname(persistPath), { recursive: true });
+    fs.mkdirSync(path.dirname(requested), { recursive: true });
+    this.registryPath = canonicalRegistryPath(requested);
+    this.anchorPath = `${this.registryPath}.anchor`;
 
-    // Single writer for the lifetime of this instance (fail startup if held).
-    const lock = this.acquireLock();
-    this.lockToken = lock.token;
+    // Single acquisition point for the writer lock.
+    this.lock = acquireLock(this.registryPath);
     try {
-      this.load(lock.historyDigest);
+      this.load();
     } catch (e) {
-      // Startup failed AFTER taking the lock: release it again - preserving
-      // the inherited history-tip anchor, never re-deriving it from a
-      // possibly truncated log - so a failed startup cannot wedge the file
-      // and cannot launder tampered history into the anchor.
-      this.releaseLockPreservingAnchor(lock.historyDigest);
+      // Nothing was committed by a failed start (the anchor is only ever
+      // advanced after successful verification), so releasing the lock cannot
+      // launder tampered history into service.
+      try {
+        this.releaseLock();
+      } catch {
+        // the startup error below is the one to report
+      }
       throw e;
     }
   }
 
   /**
    * Checks that the nonce is unused (or was used for exactly the same
-   * eventId + message) and records it. Throws NonceReuseError otherwise.
+   * eventId + message) and records it durably. Throws NonceReuseError
+   * otherwise, and throws if the record cannot be committed. The caller must
+   * not sign unless this returns normally.
    *
    * @param nonceId - Hex identifier of the derived nonce (its public point)
    * @param eventId - Event being signed
@@ -202,15 +247,20 @@ export class UsedNonceRegistry {
             `would leak the oracle key)`
         );
       }
-      // Identical (eventId, message): idempotent re-signing is safe.
+      // Identical (eventId, message): re-signing is safe once the record is
+      // durable. If an earlier commit failed, retry it before answering.
+      if (this.uncommitted) {
+        this.save();
+      }
       return;
     }
 
     const previousChain = this.log.length > 0 ? this.log[this.log.length - 1]!.chain : "";
     const entry: LogEntry = { nonceId, eventId, messageHash, chain: "" };
-    entry.chain = this.chainDigest(previousChain, entry);
+    entry.chain = chainDigest(previousChain, entry);
     this.entries.set(nonceId, { eventId, messageHash });
     this.log.push(entry);
+    this.uncommitted = true;
     this.save();
   }
 
@@ -225,196 +275,126 @@ export class UsedNonceRegistry {
   }
 
   /**
-   * Releases the single-writer lock. The registry keeps its full chained
-   * history on disk and the lock RECORD is kept (marked `released`) so the
-   * history tip remains an external anchor: truncating the log even after a
-   * clean shutdown is still detected on the next startup. Only a live,
-   * unreleased lock blocks a new instance.
+   * Releases the single-writer lock by removing the lock file. The history
+   * and its anchor stay on disk. Throws if the lock was already lost (the lock
+   * file was removed or replaced by someone else), because the caller has then
+   * been operating without exclusive access.
    */
   close(): void {
-    if (this.persistPath === null || this.lockToken === null) {
+    if (this.registryPath === null || this.lock === null) {
       return;
     }
-    this.assertLockOwnership();
-    this.writeLock({
-      pid: process.pid,
-      hostname: os.hostname(),
-      acquiredAt: new Date().toISOString(),
-      token: this.lockToken,
-      historyDigest: this.log.length > 0 ? this.log[this.log.length - 1]!.chain : null,
-      released: true,
-    });
-    this.lockToken = null;
+    if (!this.releaseLock()) {
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: the single-writer lock on ${this.registryPath} was removed or ` +
+          `replaced while this instance held it; the lock was not removed.`
+      );
+    }
   }
 
-  // ------------------------------------------------------------------
-  // Locking
-  // ------------------------------------------------------------------
-
-  private lockPath(): string {
-    return `${this.persistPath!}.lock`;
+  /** Chain tip of the in-memory log (null = empty history) */
+  private tip(): string | null {
+    return this.log.length > 0 ? this.log[this.log.length - 1]!.chain : null;
   }
 
   /**
-   * Takes the single-writer O_EXCL lock and holds it for this process.
-   *
-   * - If the lockfile exists and its owner is a live process (or a host we
-   *   cannot check), startup FAILS: two writers would both accept a nonce
-   *   and the second write would erase the first record.
-   * - If the owner died, the lock is stale: it is taken over exactly once,
-   *   carrying its recorded history digest forward so a deleted registry
-   *   cannot be silently forgotten.
-   * - A lockfile that exists but cannot be parsed is treated as held and
-   *   fatal (never silently ignored).
+   * Confirms that this instance still holds the single-writer lock. Throws
+   * before any write if the lock was removed or replaced.
    */
-  private acquireLock(): LockInfo {
-    const lockPath = this.lockPath();
-    const token = crypto.randomBytes(16).toString("hex");
-    let carriedDigest: string | null = null;
+  private assertLockHeld(): void {
+    const lock = this.lock;
+    if (lock === null || !isSameFile(lock.lockPath, lock.dev, lock.ino)) {
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: lost the single-writer lock on ${this.registryPath} (the lock ` +
+          `file was removed or replaced, or the lock was released); refusing to persist ` +
+          `nonce state.`
+      );
+    }
+  }
 
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const fd = fs.openSync(lockPath, "wx", 0o600);
-        const info: LockInfo = {
-          pid: process.pid,
-          hostname: os.hostname(),
-          acquiredAt: new Date().toISOString(),
-          token,
-          historyDigest: carriedDigest,
-        };
-        const payload = Buffer.from(JSON.stringify(info, null, 2), "utf8");
-        fs.writeSync(fd, payload, 0, payload.length, 0);
-        fs.fsyncSync(fd);
-        fs.closeSync(fd);
-        // A racing recoverer must not have replaced our lock in the meantime.
-        this.lockToken = token;
-        this.assertLockOwnership();
-        return info;
-      } catch (e) {
-        if (e instanceof NonceRegistryLockError) {
-          throw e;
-        }
-        if ((e as NodeJS.ErrnoException).code !== "EEXIST") {
-          throw new NonceRegistryLockError(
-            `UsedNonceRegistry: cannot create lock ${lockPath}: ${
-              e instanceof Error ? e.message : String(e)
-            }`
-          );
-        }
+  /**
+   * Releases the lock: closes the descriptor, and removes the lock file only
+   * if it is still the file this instance created. Returns false if the lock
+   * had been lost (the file was left alone).
+   */
+  private releaseLock(): boolean {
+    const lock = this.lock;
+    if (lock === null) {
+      return true;
+    }
+    this.lock = null;
+    const stillHeld = isSameFile(lock.lockPath, lock.dev, lock.ino);
+    fs.closeSync(lock.fd);
+    if (stillHeld) {
+      fs.unlinkSync(lock.lockPath);
+    }
+    return stillHeld;
+  }
 
-        let existing: LockInfo;
-        try {
-          const raw = fs.readFileSync(lockPath, "utf8");
-          const parsed = JSON.parse(raw) as LockInfo;
-          if (
-            !parsed ||
-            typeof parsed.pid !== "number" ||
-            typeof parsed.token !== "string" ||
-            typeof parsed.hostname !== "string"
-          ) {
-            throw new Error("malformed lock record");
-          }
-          existing = parsed;
-        } catch (readError) {
-          throw new NonceRegistryLockError(
-            `UsedNonceRegistry: lock ${lockPath} exists but cannot be read ` +
-              `(${readError instanceof Error ? readError.message : String(readError)}). ` +
-              `Refusing to start: a second writer would allow nonce reuse and oracle key recovery.`
-          );
-        }
+  // ------------------------------------------------------------------
+  // Startup
+  // ------------------------------------------------------------------
 
-        // A lock explicitly released by its writer is free to take over.
-        const released = existing.released === true;
-        if (!released) {
-          if (existing.hostname === os.hostname() && this.isPidAlive(existing.pid)) {
-            throw new NonceRegistryLockError(
-              `UsedNonceRegistry: ${this.persistPath} is locked by live process pid ` +
-                `${existing.pid} (since ${existing.acquiredAt}). Refusing to start: two ` +
-                `writers would allow the same derived nonce to sign twice and leak the oracle key.`
-            );
-          }
-          if (existing.hostname !== os.hostname()) {
-            throw new NonceRegistryLockError(
-              `UsedNonceRegistry: ${this.persistPath} is locked by pid ${existing.pid} on ` +
-                `host "${existing.hostname}", whose liveness cannot be verified from ` +
-                `"${os.hostname()}". Refusing to start.`
-            );
-          }
-        }
+  /**
+   * Verifies the stored history against the anchor, and adopts a strict
+   * extension of the anchor (see guarantee 4 in the module comment).
+   */
+  private load(): void {
+    const registry = this.registryPath!;
+    const anchor = readAnchor(this.anchorPath!);
+    const registryExists = lstatOrNull(registry) !== null;
 
-        // Stale (owner dead) or released lock: take it over once, carrying
-        // the recorded history digest forward so deletion or truncation of
-        // the registry cannot reset the nonce history.
-        carriedDigest = existing.historyDigest;
-        try {
-          fs.unlinkSync(lockPath);
-        } catch (unlinkError) {
-          if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") {
-            throw unlinkError;
-          }
-        }
+    if (registryExists) {
+      assertSingleLink(registry);
+      for (const entry of readVerifiedLog(registry)) {
+        this.entries.set(entry.nonceId, { eventId: entry.eventId, messageHash: entry.messageHash });
+        this.log.push(entry);
       }
     }
 
-    throw new NonceRegistryLockError(
-      `UsedNonceRegistry: could not acquire ${lockPath} (contention). Refusing to start.`
-    );
-  }
-
-  /**
-   * Releases the lock after a failed startup, keeping the EXISTING
-   * history-tip anchor (never recomputed from partially loaded state).
-   */
-  private releaseLockPreservingAnchor(anchor: string | null): void {
-    try {
-      this.writeLock({
-        pid: process.pid,
-        hostname: os.hostname(),
-        acquiredAt: new Date().toISOString(),
-        token: this.lockToken ?? "rolled-back",
-        historyDigest: anchor,
-        released: true,
-      });
-    } catch {
-      // best-effort: the pid-liveness check still recovers a leaked lock
+    if (anchor === null) {
+      if (this.log.length > 0) {
+        throw new NonceRegistryLockError(
+          `UsedNonceRegistry: ${registry} holds nonce history but its anchor ${this.anchorPath} ` +
+            `is missing. Refusing to start: the anchor is what detects truncation. If this ` +
+            `registry predates the anchor file, create ${this.anchorPath} containing ` +
+            `{"version": ${ANCHOR_FORMAT_VERSION}, "tip": "<chain of the last entry>"} after ` +
+            `verifying the log, then restart.`
+        );
+      }
+      // No history yet (first start, or a log without records): establish the
+      // anchor before any commit, so that a crash during the first commit
+      // cannot look like a deleted anchor.
+      this.assertLockHeld();
+      replaceFileDurably(this.anchorPath!, anchorBody(null), () => this.assertLockHeld());
+      return;
     }
-    this.lockToken = null;
-  }
 
-  /**
-   * Verifies the lockfile still belongs to this instance before any write.
-   * If the lock was stolen (or the file replaced), we must not persist: a
-   * concurrent writer's records would be silently erased.
-   */
-  private assertLockOwnership(): void {
-    const lockPath = this.lockPath();
-    let info: LockInfo;
-    try {
-      info = JSON.parse(fs.readFileSync(lockPath, "utf8")) as LockInfo;
-    } catch (e) {
+    if (!registryExists) {
+      if (anchor.tip !== null) {
+        throw new NonceRegistryLockError(
+          `UsedNonceRegistry: ${registry} is missing but its history anchor records tip ` +
+            `${anchor.tip}. The used-nonce history was deleted; refusing to start (a fresh ` +
+            `registry would reuse nonces and leak the oracle key).`
+        );
+      }
+      return;
+    }
+
+    const tipIndex =
+      anchor.tip === null ? -1 : this.log.findIndex((entry) => entry.chain === anchor.tip);
+    if (anchor.tip !== null && tipIndex === -1) {
       throw new NonceRegistryLockError(
-        `UsedNonceRegistry: lost the single-writer lock on ${this.persistPath} ` +
-          `(lock file unreadable); refusing to persist nonce state.`
+        `UsedNonceRegistry: ${registry} does not extend the anchored history tip ` +
+          `${anchor.tip}: the used-nonce history was truncated, rewritten or reset. ` +
+          `Refusing to continue (nonce reuse would leak the oracle key).`
       );
     }
-    if (info.token !== this.lockToken || info.pid !== process.pid) {
-      throw new NonceRegistryLockError(
-        `UsedNonceRegistry: lost the single-writer lock on ${this.persistPath} ` +
-          `(held by pid ${info.pid}); refusing to persist nonce state.`
-      );
-    }
-  }
-
-  private isPidAlive(pid: number): boolean {
-    if (!Number.isInteger(pid) || pid <= 0) {
-      return false;
-    }
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (e) {
-      // EPERM: exists but owned by another user - treat as alive.
-      return (e as NodeJS.ErrnoException).code === "EPERM";
+    if (tipIndex < this.log.length - 1) {
+      // A crash after the log commit and before the anchor update: the log is
+      // a strict extension of the anchored history. Accept it and advance the anchor.
+      this.assertLockHeld();
+      replaceFileDurably(this.anchorPath!, anchorBody(this.tip()), () => this.assertLockHeld());
     }
   }
 
@@ -422,165 +402,310 @@ export class UsedNonceRegistry {
   // Persistence
   // ------------------------------------------------------------------
 
-  /** Digest chain: sha256(previous chain || sha256(record fields)) */
-  private chainDigest(
-    previousChain: string,
-    entry: Pick<LogEntry, "nonceId" | "eventId" | "messageHash">
-  ): string {
-    const previous = previousChain === "" ? GENESIS_DIGEST : previousChain;
-    const record = crypto
-      .createHash("sha256")
-      .update(`${entry.nonceId}\n${entry.eventId}\n${entry.messageHash}`, "utf8")
-      .digest("hex");
-    return crypto
-      .createHash("sha256")
-      .update(previous + record, "utf8")
-      .digest("hex");
-  }
-
   /**
-   * Loads the append-only log and verifies its integrity.
-   *
-   * @param carriedDigest - chain tip recorded by the (stale) lock we took
-   *   over, or null if there was no previous lock. Cross-checked against the
-   *   log so that deleting the registry behind a lock cannot reset history.
-   */
-  private load(carriedDigest: string | null): void {
-    const fileExists = fs.existsSync(this.persistPath!);
-
-    if (!fileExists) {
-      if (carriedDigest !== null) {
-        throw new NonceRegistryLockError(
-          `UsedNonceRegistry: ${this.persistPath} is missing but the lock file records ` +
-            `nonce history (digest ${carriedDigest}). Refusing to start: the used-nonce ` +
-            `history was deleted while the registry was locked, which would allow nonce ` +
-            `reuse and oracle key recovery.`
-        );
-      }
-      return;
-    }
-
-    let parsed: PersistedShape;
-    try {
-      parsed = JSON.parse(fs.readFileSync(this.persistPath!, "utf8")) as PersistedShape;
-      if (!parsed || !Array.isArray(parsed.entries)) {
-        throw new Error("malformed registry payload");
-      }
-    } catch (e) {
-      // A corrupt registry must not silently allow nonce reuse: fail closed.
-      throw new NonceRegistryLockError(
-        `UsedNonceRegistry: cannot read ${this.persistPath}: ${e instanceof Error ? e.message : String(e)}`
-      );
-    }
-
-    // Verify the digest chain link by link: truncation, reordering or
-    // rewriting of entries is detected.
-    let chain = "";
-    for (const entry of parsed.entries) {
-      if (
-        !entry ||
-        typeof entry.nonceId !== "string" ||
-        typeof entry.eventId !== "string" ||
-        typeof entry.messageHash !== "string" ||
-        typeof entry.chain !== "string"
-      ) {
-        throw new NonceRegistryLockError(
-          `UsedNonceRegistry: ${this.persistPath} contains a malformed entry; refusing to continue.`
-        );
-      }
-      const expected = this.chainDigest(chain, entry);
-      if (expected !== entry.chain) {
-        throw new NonceRegistryLockError(
-          `UsedNonceRegistry: ${this.persistPath} failed its digest-chain check at nonce ` +
-            `${entry.nonceId}: the used-nonce history was truncated, reordered or rewritten. ` +
-            `Refusing to continue (nonce reuse would leak the oracle key).`
-        );
-      }
-      chain = entry.chain;
-      if (!this.entries.has(entry.nonceId)) {
-        this.entries.set(entry.nonceId, { eventId: entry.eventId, messageHash: entry.messageHash });
-        this.log.push({ ...entry });
-      }
-    }
-
-    const tip = chain === "" ? null : chain;
-    if (carriedDigest !== null && carriedDigest !== tip) {
-      throw new NonceRegistryLockError(
-        `UsedNonceRegistry: lock file and ${this.persistPath} disagree about the nonce ` +
-          `history tip (lock: ${carriedDigest}, log: ${tip ?? "(empty)"}). The registry ` +
-          `was modified or reset behind the lock; refusing to continue.`
-        );
-    }
-  }
-
-  /**
-   * Persists the log durably: temp file + fsync + rename + directory fsync.
-   * Never writes a payload that does not contain every recorded nonce.
+   * Commits the log, then the anchor. The log commit (the rename) is the
+   * commit point for the nonce records. The anchor is the separate recovery
+   * record described in guarantee 4. Both steps re-verify the lock first.
    */
   private save(): void {
-    if (this.persistPath === null) {
+    if (this.registryPath === null) {
+      this.uncommitted = false;
       return;
     }
-    this.assertLockOwnership();
 
-    const payload: PersistedShape = {
-      version: 2,
-      entries: this.log,
-    };
+    const payload: PersistedShape = { version: LOG_FORMAT_VERSION, entries: this.log };
     const body = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
+    replaceFileDurably(this.registryPath, body, () => {
+      this.assertLockHeld();
+      assertSingleLink(this.registryPath!);
+    });
+    this.uncommitted = false;
 
-    // Write to a private temp file in the same directory, fsync, then
-    // atomically rename over the registry.
-    const tmpPath = `${this.persistPath}.tmp.${this.lockToken ?? "mem"}`;
-    const fd = fs.openSync(tmpPath, "wx", 0o600);
-    try {
-      fs.writeSync(fd, body, 0, body.length, 0);
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
+    replaceFileDurably(this.anchorPath!, anchorBody(this.tip()), () => this.assertLockHeld());
+  }
+}
+
+// ----------------------------------------------------------------------
+// Module-level helpers
+// ----------------------------------------------------------------------
+
+/** Digest chain: sha256(previous chain || sha256(record fields)) */
+function chainDigest(
+  previousChain: string,
+  entry: Pick<LogEntry, "nonceId" | "eventId" | "messageHash">
+): string {
+  const previous = previousChain === "" ? GENESIS_DIGEST : previousChain;
+  const record = crypto
+    .createHash("sha256")
+    .update(`${entry.nonceId}\n${entry.eventId}\n${entry.messageHash}`, "utf8")
+    .digest("hex");
+  return crypto.createHash("sha256").update(previous + record, "utf8").digest("hex");
+}
+
+/**
+ * Resolves the registry path to its canonical form. Every spelling of one
+ * file (symlinks, `..`, `.`) maps to the same string, so it yields one lock.
+ */
+function canonicalRegistryPath(requested: string): string {
+  const absolute = path.resolve(requested);
+  try {
+    return fs.realpathSync.native(absolute);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: cannot resolve ${absolute}: ${(e as Error).message}`
+      );
     }
-    fs.renameSync(tmpPath, this.persistPath);
+  }
+  // The file does not exist yet. A dangling symlink also reports ENOENT, and
+  // must not be "created" through its target.
+  if (lstatOrNull(absolute) !== null) {
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: ${absolute} is a dangling symlink; refusing to create its target`
+    );
+  }
+  return path.join(fs.realpathSync.native(path.dirname(absolute)), path.basename(absolute));
+}
 
-    // fsync the directory so the rename itself is durable.
-    try {
-      const dirFd = fs.openSync(path.dirname(this.persistPath), "r");
-      try {
-        fs.fsyncSync(dirFd);
-      } finally {
-        fs.closeSync(dirFd);
-      }
-    } catch (e) {
-      // Directory fsync is unsupported on some platforms; the rename is
-      // still atomic, so continue.
+/**
+ * Creates `<registryPath>.lock` exclusively. This is the only place a lock is
+ * taken. An existing lock is never reclaimed: the error explains how an
+ * operator clears a lock left by a crash.
+ */
+function acquireLock(registryPath: string): HeldLock {
+  const lockPath = `${registryPath}.lock`;
+  let fd: number;
+  try {
+    fd = fs.openSync(lockPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: ${registryPath} is locked: ${lockPath} exists${describeLockHolder(
+          lockPath
+        )}. Refusing to start: two writers could sign with the same derived nonce and leak ` +
+          `the oracle key. Locks are never taken over automatically. If a crashed process left ` +
+          `this lock, confirm that no process uses this registry, then remove ${lockPath} and ` +
+          `restart. The history anchor still detects truncation after removal.`
+      );
     }
-
-    this.updateLockDigest();
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: cannot create lock ${lockPath}: ${(e as Error).message}`
+    );
   }
 
-  /** Atomically rewrites the lockfile (temp file + fsync + rename) */
-  private writeLock(info: LockInfo): void {
-    const lockPath = this.lockPath();
-    const tmpPath = `${lockPath}.tmp.${this.lockToken ?? "init"}`;
-    const body = Buffer.from(JSON.stringify(info, null, 2), "utf8");
-    const fd = fs.openSync(tmpPath, "wx", 0o600);
-    try {
-      fs.writeSync(fd, body, 0, body.length, 0);
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.renameSync(tmpPath, lockPath);
-  }
-
-  /** Keeps the lockfile's recorded history tip in sync with the log */
-  private updateLockDigest(): void {
-    const tip = this.log.length > 0 ? this.log[this.log.length - 1]!.chain : null;
-    this.writeLock({
+  let st: fs.BigIntStats;
+  try {
+    st = fs.fstatSync(fd, { bigint: true });
+    const info = {
       pid: process.pid,
       hostname: os.hostname(),
       acquiredAt: new Date().toISOString(),
-      token: this.lockToken!,
-      historyDigest: tip,
-    });
+    };
+    writeAll(fd, Buffer.from(JSON.stringify(info, null, 2), "utf8"));
+    fs.fsyncSync(fd);
+  } catch (e) {
+    // We created this file and never returned the lock: remove it so a failed
+    // start does not wedge the registry.
+    fs.closeSync(fd);
+    try {
+      const current = lstatOrNull(lockPath);
+      if (current !== null) {
+        fs.unlinkSync(lockPath);
+      }
+    } catch {
+      // best-effort; the error below is the one to report
+    }
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: cannot initialize lock ${lockPath}: ${(e as Error).message}`
+    );
   }
+
+  return { lockPath, fd, dev: st.dev, ino: st.ino };
+}
+
+/** Best-effort, informational only: never used for a decision */
+function describeLockHolder(lockPath: string): string {
+  try {
+    const info = JSON.parse(fs.readFileSync(lockPath, "utf8")) as Partial<{
+      pid: number;
+      hostname: string;
+      acquiredAt: string;
+    }>;
+    return ` (recorded holder: pid ${info.pid} on ${info.hostname} since ${info.acquiredAt})`;
+  } catch {
+    return "";
+  }
+}
+
+/** True when `lockPath` is still the regular file with the given identity */
+function isSameFile(filePath: string, dev: bigint, ino: bigint): boolean {
+  const st = lstatOrNull(filePath);
+  return st !== null && st.isFile() && st.dev === dev && st.ino === ino;
+}
+
+/** lstat with bigint fields; null when the path does not exist */
+function lstatOrNull(filePath: string): fs.BigIntStats | null {
+  try {
+    return fs.lstatSync(filePath, { bigint: true });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw e;
+  }
+}
+
+/** The registry must be a regular file with exactly one hard link */
+function assertSingleLink(registryPath: string): void {
+  const st = lstatOrNull(registryPath);
+  if (st === null) {
+    return;
+  }
+  if (!st.isFile() || st.nlink !== 1n) {
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: ${registryPath} must be a regular file with exactly one hard link ` +
+        `(found ${st.isFile() ? `${st.nlink} links` : "a non-regular file"}); refusing to ` +
+        `read or persist nonce state through an alias.`
+    );
+  }
+}
+
+/** Reads the anchor. null = no anchor file. */
+function readAnchor(anchorPath: string): { tip: string | null } | null {
+  if (lstatOrNull(anchorPath) === null) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(anchorPath, "utf8"));
+  } catch (e) {
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: cannot read history anchor ${anchorPath}: ${(e as Error).message}`
+    );
+  }
+  const shape = parsed as Partial<AnchorShape> | null;
+  const validTip =
+    shape !== null &&
+    typeof shape === "object" &&
+    shape.version === ANCHOR_FORMAT_VERSION &&
+    (shape.tip === null || (typeof shape.tip === "string" && HEX_DIGEST.test(shape.tip)));
+  if (!validTip) {
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: history anchor ${anchorPath} is malformed; refusing to start.`
+    );
+  }
+  return { tip: shape!.tip as string | null };
+}
+
+function anchorBody(tip: string | null): Buffer {
+  const anchor: AnchorShape = { version: ANCHOR_FORMAT_VERSION, tip };
+  return Buffer.from(JSON.stringify(anchor, null, 2), "utf8");
+}
+
+/**
+ * Parses the registry and verifies every link of the digest chain. Refuses
+ * truncation, reordering, rewriting, malformed entries, and duplicate nonces
+ * (a valid log never contains two records for one nonce).
+ */
+function readVerifiedLog(registryPath: string): LogEntry[] {
+  let parsed: PersistedShape;
+  try {
+    parsed = JSON.parse(fs.readFileSync(registryPath, "utf8")) as PersistedShape;
+  } catch (e) {
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: cannot read ${registryPath}: ${(e as Error).message}`
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.entries)) {
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: ${registryPath} has a malformed payload; refusing to continue.`
+    );
+  }
+
+  const verified: LogEntry[] = [];
+  const seen = new Set<string>();
+  let previous = "";
+  for (const entry of parsed.entries) {
+    if (
+      !entry ||
+      typeof entry.nonceId !== "string" ||
+      typeof entry.eventId !== "string" ||
+      typeof entry.messageHash !== "string" ||
+      typeof entry.chain !== "string"
+    ) {
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: ${registryPath} contains a malformed entry; refusing to continue.`
+      );
+    }
+    if (chainDigest(previous, entry) !== entry.chain) {
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: ${registryPath} failed its digest-chain check at nonce ` +
+          `${entry.nonceId}: the used-nonce history was truncated, reordered or rewritten. ` +
+          `Refusing to continue (nonce reuse would leak the oracle key).`
+      );
+    }
+    if (seen.has(entry.nonceId)) {
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: ${registryPath} records nonce ${entry.nonceId} twice; ` +
+          `refusing to continue.`
+      );
+    }
+    seen.add(entry.nonceId);
+    verified.push({ ...entry });
+    previous = entry.chain;
+  }
+  return verified;
+}
+
+/** Writes every byte, looping over short writes */
+function writeAll(fd: number, body: Buffer): void {
+  let offset = 0;
+  while (offset < body.length) {
+    offset += fs.writeSync(fd, body, offset, body.length - offset, null);
+  }
+}
+
+/** fsyncs a directory so that a rename inside it is durable */
+function fsyncDirectory(dir: string): void {
+  const fd = fs.openSync(dir, fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Atomically replaces `target` with `body`: temp file, fsync, the
+ * `beforeCommit` re-check, rename, directory fsync. Throws on any failure, and
+ * the commit is only complete when it returns normally.
+ */
+function replaceFileDurably(target: string, body: Buffer, beforeCommit: () => void): void {
+  const tmp = `${target}.tmp`;
+  // Leftover of an interrupted write. Only the lock holder writes here, and
+  // the lock is verified below before every commit.
+  const leftover = lstatOrNull(tmp);
+  if (leftover !== null) {
+    fs.unlinkSync(tmp);
+  }
+
+  const fd = fs.openSync(
+    tmp,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+    0o600
+  );
+  try {
+    writeAll(fd, body);
+    fs.fsyncSync(fd);
+    beforeCommit();
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    fs.closeSync(fd);
+    if (lstatOrNull(tmp) !== null) {
+      fs.unlinkSync(tmp);
+    }
+    throw e;
+  }
+  fs.closeSync(fd);
+  fsyncDirectory(path.dirname(target));
 }

@@ -166,12 +166,19 @@ describe("fix 1: used-nonce registry is fail-closed", () => {
     }
   });
 
-  it("takes over a crashed writer's lock with full history and still refuses reuse", () => {
+  it("never takes over a crashed writer's lock; operator removal restores full history", () => {
     const registryPath = tmpPath();
     // Child records a nonce and exits WITHOUT close() (crash semantics).
     const out = runChild("record", registryPath);
     expect(out).toContain("RECORDED");
 
+    // The stale lock blocks startup, whatever its contents.
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+      /is locked.*Locks are never taken over automatically/s
+    );
+
+    // After the operator removes it, history is intact and reuse is refused.
+    fs.unlinkSync(`${registryPath}.lock`);
     const restarted = new UsedNonceRegistry({ persistPath: registryPath });
     expect(restarted.get("aa".repeat(32))).toEqual({
       eventId: "event-child",
@@ -185,10 +192,12 @@ describe("fix 1: used-nonce registry is fail-closed", () => {
 
   it("detects deletion of the registry behind the lock (history cannot be reset)", () => {
     const registryPath = tmpPath();
-    runChild("record", registryPath); // leaves lockfile with history digest
+    const first = new UsedNonceRegistry({ persistPath: registryPath });
+    first.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
+    first.close(); // the anchor keeps the history tip
     fs.unlinkSync(registryPath); // attacker deletes the registry
     expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
-      /deleted while the registry was locked/
+      /is missing but its history anchor records tip/
     );
   });
 
@@ -200,13 +209,12 @@ describe("fix 1: used-nonce registry is fail-closed", () => {
     first.checkAndRecord("33".repeat(32), "event-3", "cc".repeat(32));
     first.close(); // releases the writer lock but keeps its history-tip anchor
 
-    // (a) Tail truncation ("forget the newest nonce") is caught by the
-    // lockfile's recorded history tip.
+    // (a) Tail truncation ("forget the newest nonce") is caught by the anchor.
     const tail = JSON.parse(fs.readFileSync(registryPath, "utf8"));
     tail.entries.pop();
     fs.writeFileSync(registryPath, JSON.stringify(tail));
     expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
-      /disagree about the nonce history tip/
+      /does not extend the anchored history tip/
     );
 
     // (b) Mid-chain rewriting is caught by the digest chain itself.

@@ -5,9 +5,12 @@
  *
  * Modes:
  *   record  - open the registry, record a nonce, then exit WITHOUT close()
- *             (simulates a crash: the single-writer lockfile must remain)
+ *             (simulates a crash: the lockfile must remain)
  *   hold    - open the registry, record a nonce, announce HELD, stay alive
  *   open    - open the registry and announce OPENED (fails loudly on refusal)
+ *   race    - wait until the absolute time <startAtMs> (argv[4]), then open the
+ *             registry and record the SAME nonce with event "race-<pid>"; announce
+ *             ACQUIRED and hold for 1.5s, or announce REFUSED (exit 3)
  */
 "use strict";
 
@@ -18,10 +21,24 @@ const {
   NonceRegistryLockError,
 } = require("../../src/attestation/used-nonce-registry");
 
-const [, , registryPath, mode] = process.argv;
+const [, , registryPath, mode, startAtArg] = process.argv;
 
 try {
+  if (mode === "race") {
+    const startAt = Number(startAtArg);
+    while (Date.now() < startAt) {
+      // spin until the shared start time so both racers contend at once
+    }
+  }
+
   const registry = new UsedNonceRegistry({ persistPath: registryPath });
+
+  if (mode === "race") {
+    registry.checkAndRecord("dd".repeat(32), `race-${process.pid}`, "ee".repeat(32));
+    console.log("ACQUIRED");
+    setTimeout(() => process.exit(0), 1500);
+    return;
+  }
 
   if (mode === "record") {
     registry.checkAndRecord("aa".repeat(32), "event-child", "bb".repeat(32));
