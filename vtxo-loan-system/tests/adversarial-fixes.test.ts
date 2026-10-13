@@ -40,7 +40,6 @@ import {
   DEFAULT_API_AUTH_KEY,
   SystemConfig,
   loadConfig,
-  loadConfigFromEnv,
   normalizeKeyProvider,
   validateConfig,
 } from "../src/config/system-config";
@@ -337,8 +336,10 @@ describe("fix 3: config normalization and mainnet-implied hardening", () => {
   });
 
   it("throws on unrecognized KEY_PROVIDER values in any mode", async () => {
+    // loadConfigFromEnv only reads the environment; normalization (and the
+    // refusal) happens in loadConfig / validateConfig.
     await withEnv({ KEY_PROVIDER: "nonsense", ORACLE_MODE: "development", NETWORK: "regtest" }, () => {
-      expect(() => loadConfigFromEnv()).toThrow(/Unrecognized KEY_PROVIDER/);
+      expect(() => loadConfig()).toThrow(/Unrecognized KEY_PROVIDER/);
     });
     expect(() => normalizeKeyProvider("hsm")).toThrow(/Unrecognized KEY_PROVIDER/);
     // programmatic construction with a garbage provider is caught too

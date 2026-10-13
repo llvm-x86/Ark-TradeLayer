@@ -172,49 +172,85 @@ export const DEFAULT_API_AUTH_KEY = "dev-key-insecure";
 
 /** Allowlisted key-custody providers */
 export const KEY_PROVIDERS = ["local", "gcp", "aws", "mock"] as const;
+/** Allowlisted Bitcoin networks */
+export const NETWORK_TYPES = ["mainnet", "testnet", "regtest", "signet"] as const;
+/** Allowlisted oracle operating modes */
+export const ORACLE_MODES = ["development", "staging", "production"] as const;
+
+/** Minimum length of API_AUTH_KEY outside development (non-whitespace characters) */
+export const MIN_API_AUTH_KEY_LENGTH = 16;
 
 /**
- * Normalizes and validates a KEY_PROVIDER value.
+ * The single normalization rule for every enum-valued setting: trim, lowercase,
+ * then require membership in the allowlist. Anything else throws, always.
  *
- * Strict-comparing the raw environment string ("mock" === provider) was
- * bypassable with trivial variations - KEY_PROVIDER=Mock, MOCK, " mock" or
- * any nonsense value silently skipped the fail-closed checks and ran in
- * production. Values are trimmed + lowercased and must be in the allowlist;
- * anything else throws, always.
+ * Strict comparison of raw strings was bypassable: KEY_PROVIDER=Mock, MOCK,
+ * " mock" or NETWORK=Mainnet skipped the fail-closed checks.
  */
-export function normalizeKeyProvider(raw: unknown): KeyManagementConfig["provider"] {
+function normalizeEnum<T extends string>(raw: unknown, allowed: readonly T[], label: string): T {
   const normalized = typeof raw === "string" ? raw.trim().toLowerCase() : "";
-  if (!(KEY_PROVIDERS as readonly string[]).includes(normalized)) {
+  if (!(allowed as readonly string[]).includes(normalized)) {
     throw new Error(
-      `Unrecognized KEY_PROVIDER ${JSON.stringify(raw)}; allowed values: ${KEY_PROVIDERS.join(", ")}`
+      `Unrecognized ${label} ${JSON.stringify(raw)}; allowed values: ${allowed.join(", ")}`
     );
   }
-  return normalized as KeyManagementConfig["provider"];
+  return normalized as T;
 }
 
-/** Normalizes a NETWORK value (trim + lowercase) */
-export function normalizeNetwork(raw: unknown): string {
-  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
-}
-
-/** Normalizes an ORACLE_MODE value (trim + lowercase) */
-export function normalizeMode(raw: unknown): string {
-  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
+/** Normalizes and validates a KEY_PROVIDER value (see normalizeEnum) */
+export function normalizeKeyProvider(raw: unknown): KeyManagementConfig["provider"] {
+  return normalizeEnum(raw, KEY_PROVIDERS, "KEY_PROVIDER");
 }
 
 /**
- * Loads configuration from environment variables
+ * Canonical form of a configuration: every enum-valued field normalized, or
+ * a throw. validateConfig and loadConfig both go through this function, which
+ * is the one place config values are normalized.
+ */
+export function normalizeConfig(raw: SystemConfig): SystemConfig {
+  return {
+    ...raw,
+    network: normalizeEnum(raw.network, NETWORK_TYPES, "network"),
+    mode: normalizeEnum(raw.mode, ORACLE_MODES, "mode"),
+    keys: { ...raw.keys, provider: normalizeKeyProvider(raw.keys.provider) },
+  };
+}
+
+/**
+ * The single API_AUTH_KEY policy. Returns the reason the key is unacceptable,
+ * or null. Enforced outside development (mainnet implies outside development).
+ * Whitespace does not count toward the length: " " or "   " are refused.
+ */
+export function apiAuthKeyViolation(authKey: unknown): string | null {
+  if (typeof authKey !== "string") {
+    return "API_AUTH_KEY must be a string";
+  }
+  if (authKey === DEFAULT_API_AUTH_KEY) {
+    return "API_AUTH_KEY is the insecure default";
+  }
+  const significant = authKey.replace(/\s/g, "").length;
+  if (significant < MIN_API_AUTH_KEY_LENGTH) {
+    return (
+      `API_AUTH_KEY must have at least ${MIN_API_AUTH_KEY_LENGTH} non-whitespace ` +
+      `characters (got ${significant})`
+    );
+  }
+  return null;
+}
+
+/**
+ * Loads configuration from environment variables.
+ *
+ * Values are read as given. Enum-valued settings (NETWORK, ORACLE_MODE,
+ * KEY_PROVIDER) are normalized and checked by validateConfig / loadConfig, not
+ * here, so there is exactly one normalization point.
  */
 export function loadConfigFromEnv(): SystemConfig {
-  // Network configuration (normalized so e.g. NETWORK=Mainnet cannot dodge
-  // the mainnet-implied production checks below)
-  const networkType = normalizeNetwork(process.env.NETWORK || "regtest") as NetworkType;
-  const mode = normalizeMode(process.env.ORACLE_MODE || "development") as OracleMode;
+  const networkType = (process.env.NETWORK || "regtest") as NetworkType;
+  const mode = (process.env.ORACLE_MODE || "development") as OracleMode;
 
-  // Key management (normalized + allowlisted; throws on anything else)
-  const keyProvider = normalizeKeyProvider(process.env.KEY_PROVIDER || "mock");
   const keys: KeyManagementConfig = {
-    provider: keyProvider,
+    provider: (process.env.KEY_PROVIDER || "mock") as KeyManagementConfig["provider"],
     mnemonic: process.env.MNEMONIC,
     projectId: process.env.CLOUD_PROJECT_ID,
     secretId: process.env.CLOUD_SECRET_ID || "oracle-mnemonic",
@@ -328,35 +364,20 @@ export function getBitcoinNetwork(networkType: NetworkType): BitcoinNetwork {
  * credentials outside development) are fail-closed: they THROW here instead
  * of being returned as soft errors that a caller could ignore.
  */
-export function validateConfig(config: SystemConfig): string[] {
+export function validateConfig(input: SystemConfig): string[] {
+  // Normalization happens here, through normalizeConfig: an unrecognized
+  // network, mode or provider throws, so it can never be returned as a soft
+  // error that a caller might ignore while the security checks run on it.
+  const config = normalizeConfig(input);
   const errors: string[] = [];
   const critical: string[] = [];
-
-  // Validate network
-  if (!["mainnet", "testnet", "regtest", "signet"].includes(config.network)) {
-    errors.push(`Invalid network: ${config.network}`);
-  }
-
-  // Validate mode
-  if (!["development", "staging", "production"].includes(config.mode)) {
-    errors.push(`Invalid oracle mode: ${config.mode}`);
-  }
 
   // --- Fail-closed security checks (C3) ---------------------------------
   // Insecure key custody must never leave development, and never touch mainnet.
   // MAINNET ALWAYS IMPLIES OUTSIDE-DEVELOPMENT: production semantics cannot
   // be weakened by setting ORACLE_MODE=development against a mainnet network.
-  const outsideDevelopment =
-    config.mode !== "development" || config.network === "mainnet";
-
-  // The provider must normalize into the allowlist; casing/padding games
-  // (KEY_PROVIDER=Mock, MOCK, " mock") and typos are fatal, always.
-  let provider: KeyManagementConfig["provider"] | undefined;
-  try {
-    provider = normalizeKeyProvider(config.keys.provider);
-  } catch (e) {
-    critical.push(e instanceof Error ? e.message : String(e));
-  }
+  const outsideDevelopment = config.mode !== "development" || config.network === "mainnet";
+  const provider = config.keys.provider;
 
   if (provider === "mock" && outsideDevelopment) {
     critical.push(
@@ -383,19 +404,17 @@ export function validateConfig(config: SystemConfig): string[] {
     }
   }
 
-  // Default credentials are never acceptable outside development (and
-  // mainnet implies outside development)
-  if (outsideDevelopment && config.api.authKey === DEFAULT_API_AUTH_KEY) {
+  // API_AUTH_KEY policy (default key refused; minimum strength)
+  const authKeyProblem = apiAuthKeyViolation(config.api.authKey);
+  if (outsideDevelopment && authKeyProblem !== null) {
     critical.push(
-      `API_AUTH_KEY is the insecure default; refusing to run with mode=${config.mode} ` +
-        `network=${config.network}. Set a strong API_AUTH_KEY.`
+      `${authKeyProblem}; refusing to run with mode=${config.mode} network=${config.network}. ` +
+        `Set a strong API_AUTH_KEY.`
     );
   }
 
   if (critical.length > 0) {
-    throw new Error(
-      `Fatal configuration errors (refusing to start):\n${critical.join("\n")}`
-    );
+    throw new Error(`Fatal configuration errors (refusing to start):\n${critical.join("\n")}`);
   }
   // ----------------------------------------------------------------------
 
@@ -424,15 +443,18 @@ export function validateConfig(config: SystemConfig): string[] {
 }
 
 /**
- * Loads and validates configuration
+ * Loads, normalizes and validates configuration. Returns the normalized
+ * configuration: the values the security checks ran on.
  */
 export function loadConfig(): SystemConfig {
-  const config = loadConfigFromEnv();
-  const errors = validateConfig(config);
+  const raw = loadConfigFromEnv();
+  const errors = validateConfig(raw);
 
   if (errors.length > 0) {
     throw new Error(`Configuration errors:\n${errors.join("\n")}`);
   }
+
+  const config = normalizeConfig(raw);
 
   // Startup log (C3): surface the key custody and the configured trusted
   // oracle/ASP key so operators can verify what the verifier will pin.

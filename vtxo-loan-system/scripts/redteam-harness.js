@@ -52,7 +52,6 @@ const {
 const { MockKeyProvider } = require("../src/keys/key-provider");
 const {
   loadConfig,
-  loadConfigFromEnv,
   normalizeKeyProvider,
   validateConfig,
   DEFAULT_API_AUTH_KEY,
@@ -370,8 +369,7 @@ async function main() {
     }
     withEnv(
       { KEY_PROVIDER: "nonsense", ORACLE_MODE: "development", NETWORK: "regtest" },
-      () =>
-        expectThrow(() => loadConfigFromEnv(), /Unrecognized KEY_PROVIDER/, "nonsense provider")
+      () => expectThrow(() => loadConfig(), /Unrecognized KEY_PROVIDER/, "nonsense provider")
     );
     // and the normalized value is what runs in development
     withEnv(
@@ -414,7 +412,7 @@ async function main() {
           ...base,
           network: "mainnet",
           mode: "production",
-          api: { ...base.api, authKey: "strong-key" },
+          api: { ...base.api, authKey: "strong-key-0123456789" },
           keys: { provider: "local", mnemonic: "m", allowLocalKeys: true },
         }),
       /network=mainnet/,
@@ -428,7 +426,7 @@ async function main() {
           ...base,
           network: "mainnet",
           mode: "development",
-          api: { ...base.api, authKey: "strong-key" },
+          api: { ...base.api, authKey: "strong-key-0123456789" },
           keys: { provider: "mock", allowLocalKeys: false },
         }),
       /KEY_PROVIDER=mock/,
