@@ -290,6 +290,21 @@ export function isValidDescriptor(descriptor: EventDescriptor): boolean {
 }
 
 /**
+ * Throwing form of isValidDescriptor: the ONLY descriptor validator. Used by
+ * announcement creation and by every attest* method (before any value is
+ * scaled or any nonce is derived).
+ */
+export function assertValidDescriptor(descriptor: EventDescriptor): void {
+  if (!isValidDescriptor(descriptor)) {
+    throw new Error(
+      "Invalid event descriptor: numeric descriptors need integer base 2..36, " +
+        "numDigits >= 1, precision 0..18 and a printable-ASCII unit; binary/enum " +
+        "descriptors need distinct, non-empty, printable-ASCII outcome labels"
+    );
+  }
+}
+
+/**
  * Canonical attestation message (v1).
  *
  * The signed digest covers - in this exact order, each field prefixed with a
@@ -378,24 +393,59 @@ export function constantTimeEquals(a: Buffer, b: Buffer): boolean {
   return timingSafeEqual(a, b);
 }
 
+/** A value that can be attested: exact decimal string, bigint, or a JS number */
+export type AttestableValue = number | string | bigint;
+
+/** Largest decimal exponent accepted in a value (bounds the BigInt work) */
+const MAX_DECIMAL_EXPONENT = 400;
+/** Longest decimal text accepted for a value */
+const MAX_DECIMAL_TEXT_LENGTH = 128;
+
 /**
- * Scales a decimal value by 10^precision exactly.
+ * Scales a decimal value by 10^precision exactly, into an integer BigInt.
  *
- * The value's shortest round-trip decimal representation is parsed as a
- * decimal string (never via floating-point multiplication, which is not
- * exact) and scaled to an integer BigInt. Values with more decimal places
- * than `precision` are rejected rather than rounded.
+ * - bigint: scaled exactly.
+ * - string: parsed as an exact decimal ("12.34", "-7", "1e-7"). Use this form
+ *   for any value that is not exactly representable as a JS number.
+ * - number: its shortest round-trip decimal form is parsed (never by
+ *   floating-point multiplication). Numbers beyond Number.MAX_SAFE_INTEGER in
+ *   magnitude are REJECTED: the double has already lost the digits the caller
+ *   wrote (123456789012345678 is stored as 123456789012345680), so attesting it
+ *   would silently attest a different value.
+ *
+ * Values with more decimal places than `precision` are rejected, not rounded.
  */
-export function scaleValueByPrecision(value: number, precision: number): bigint {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`Cannot attest non-finite value: ${value}`);
-  }
+export function scaleValueByPrecision(value: AttestableValue, precision: number): bigint {
   if (!Number.isInteger(precision) || precision < 0) {
     throw new Error(`Invalid precision: ${precision}`);
   }
 
-  // Exact parse of the round-trip decimal form (handles "1e-7", "12.34", ...)
-  const text = String(value);
+  if (typeof value === "bigint") {
+    return value * 10n ** BigInt(precision);
+  }
+
+  let text: string;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error(`Cannot attest non-finite value: ${value}`);
+    }
+    if (Math.abs(value) > Number.MAX_SAFE_INTEGER) {
+      throw new Error(
+        `Cannot attest ${value}: the magnitude exceeds Number.MAX_SAFE_INTEGER, so the ` +
+          `number cannot hold the intended digits. Pass the value as a decimal string or bigint.`
+      );
+    }
+    text = String(value);
+  } else if (typeof value === "string") {
+    text = value;
+  } else {
+    throw new Error(`Cannot attest value of type ${typeof value}`);
+  }
+
+  // Exact parse of the decimal form (handles "1e-7", "12.34", ...)
+  if (text.length > MAX_DECIMAL_TEXT_LENGTH) {
+    throw new Error(`Cannot attest value: decimal text longer than ${MAX_DECIMAL_TEXT_LENGTH} characters`);
+  }
   const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(text);
   if (!match) {
     throw new Error(`Cannot attest non-decimal value: ${text}`);
@@ -404,6 +454,9 @@ export function scaleValueByPrecision(value: number, precision: number): bigint 
   const intPart = match[2] ?? "0";
   const fracPart = match[3] ?? "";
   const exponent = match[4] === undefined ? 0 : parseInt(match[4], 10);
+  if (Math.abs(exponent) > MAX_DECIMAL_EXPONENT) {
+    throw new Error(`Cannot attest value ${text}: exponent out of range`);
+  }
 
   // value = sign * digits * 10^(exponent - fracPart.length)
   const digits = BigInt(intPart + fracPart);
@@ -587,10 +640,8 @@ export class AttestationEngine {
 
     switch (descriptor.type) {
       case AttestationType.NUMERIC: {
+        // base is range-checked by isValidDescriptor (the caller's contract)
         const { base, signed } = descriptor;
-        if (!Number.isInteger(base) || base < 2 || base > 36) {
-          return false;
-        }
         const digits = new Set<string>();
         for (let d = 0; d < base; d++) {
           digits.add(d.toString(base));
@@ -631,13 +682,7 @@ export class AttestationEngine {
     }
     // Throws for non-printable-ASCII event ids (would collide under utf8)
     hashEventId(eventId);
-    if (!isValidDescriptor(descriptor)) {
-      throw new Error(
-        "Invalid event descriptor: numeric descriptors need integer base 2..36, " +
-          "numDigits >= 1, precision 0..18 and a printable-ASCII unit; binary/enum " +
-          "descriptors need distinct, non-empty, printable-ASCII outcome labels"
-      );
-    }
+    assertValidDescriptor(descriptor);
     if (!Number.isSafeInteger(maturityTime) || maturityTime <= 0) {
       throw new Error(`Invalid maturityTime: ${maturityTime}`);
     }
@@ -690,16 +735,9 @@ export class AttestationEngine {
    */
   async attestNumeric(
     announcement: EventAnnouncement,
-    value: number
+    value: AttestableValue
   ): Promise<EventAttestation> {
-    if (announcement.descriptor.type !== AttestationType.NUMERIC) {
-      throw new Error("Announcement is not numeric type");
-    }
-
-    const descriptor = announcement.descriptor;
-    if (!isValidDescriptor(descriptor)) {
-      throw new Error("Announcement descriptor is not valid; refusing to attest");
-    }
+    const descriptor = this.requireAttestable(announcement, AttestationType.NUMERIC);
     const { base, numDigits, signed, precision } = descriptor;
 
     const scaled = scaleValueByPrecision(value, precision);
@@ -736,11 +774,7 @@ export class AttestationEngine {
     announcement: EventAnnouncement,
     outcome: boolean
   ): Promise<EventAttestation> {
-    if (announcement.descriptor.type !== AttestationType.BINARY) {
-      throw new Error("Announcement is not binary type");
-    }
-
-    const descriptor = announcement.descriptor;
+    const descriptor = this.requireAttestable(announcement, AttestationType.BINARY);
     const [labelTrue, labelFalse] = descriptor.outcomes;
     const outcomeString = outcome ? labelTrue : labelFalse;
 
@@ -754,12 +788,8 @@ export class AttestationEngine {
     announcement: EventAnnouncement,
     outcomeIndex: number
   ): Promise<EventAttestation> {
-    if (announcement.descriptor.type !== AttestationType.ENUM) {
-      throw new Error("Announcement is not enum type");
-    }
+    const descriptor = this.requireAttestable(announcement, AttestationType.ENUM);
 
-    const descriptor = announcement.descriptor;
-    
     if (outcomeIndex < 0 || outcomeIndex >= descriptor.outcomes.length) {
       throw new Error(`Invalid outcome index ${outcomeIndex}`);
     }
@@ -769,6 +799,23 @@ export class AttestationEngine {
       throw new Error(`Invalid outcome index ${outcomeIndex}`);
     }
     return this.signOutcomes(announcement, [outcome]);
+  }
+
+  /**
+   * The shared entry check of every attest* method: the announcement must be
+   * of the expected type and carry a valid descriptor. It runs before any value
+   * is scaled, any label is read, or any nonce is derived, so a malformed
+   * descriptor cannot reach signing.
+   */
+  private requireAttestable<T extends AttestationType>(
+    announcement: EventAnnouncement,
+    expected: T
+  ): Extract<EventDescriptor, { type: T }> {
+    if (announcement.descriptor.type !== expected) {
+      throw new Error(`Announcement is not ${expected} type`);
+    }
+    assertValidDescriptor(announcement.descriptor);
+    return announcement.descriptor as Extract<EventDescriptor, { type: T }>;
   }
 
   /**
