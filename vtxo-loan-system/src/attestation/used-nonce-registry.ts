@@ -248,12 +248,15 @@ export class UsedNonceRegistry {
       return;
     }
 
-    fs.mkdirSync(path.dirname(requested), { recursive: true });
-    this.registryPath = canonicalRegistryPath(requested);
-    this.anchorPath = `${this.registryPath}.anchor`;
-
-    // Single acquisition point for the writer lock.
-    this.lock = acquireLock(this.registryPath);
+    try {
+      fs.mkdirSync(path.dirname(requested), { recursive: true });
+      this.registryPath = canonicalRegistryPath(requested);
+      this.anchorPath = `${this.registryPath}.anchor`;
+      // Single acquisition point for the writer lock.
+      this.lock = acquireLock(this.registryPath);
+    } catch (e) {
+      throw startupError(requested, e);
+    }
     heldInstances.add(this);
     installShutdownHooks();
     try {
@@ -269,7 +272,7 @@ export class UsedNonceRegistry {
       } catch {
         // the startup error below is the one to report
       }
-      throw e;
+      throw startupError(this.registryPath!, e);
     }
   }
 
@@ -626,7 +629,7 @@ function acquireLock(registryPath: string): HeldLock {
           `process that was killed with SIGKILL, ran out of memory, or lost power. To recover: ` +
           `(1) confirm that no signer process is running against this registry (for example ` +
           `\`ps aux | grep -i oracle\` and check the recorded pid); (2) run ` +
-          `\`rm -- '${lockPath}'\`; (3) restart. The removal does not touch the history or the ` +
+          `\`rm -- ${shellQuote(lockPath)}\`; (3) restart. The removal does not touch the history or the ` +
           `anchor, and both are re-verified on restart.`
       );
     }
@@ -727,10 +730,13 @@ function readSingleLinkFile(filePath: string): string | null {
     if (code === "ENOENT") {
       return null;
     }
-    throw new NonceRegistryLockError(
-      `UsedNonceRegistry: cannot open ${filePath} without following links: ${(e as Error).message}` +
-        ` (a symlink here is refused)`
-    );
+    if (code === "ELOOP") {
+      // O_NOFOLLOW on a symlink. Any other error is a storage error and goes to startupError.
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: ${filePath} is a symbolic link; refusing to read nonce state through a link`
+      );
+    }
+    throw e;
   }
   try {
     const st = fs.fstatSync(fd, { bigint: true });
@@ -855,6 +861,30 @@ function parseVerifiedLog(text: string, registryPath: string): LogEntry[] {
     previous = entry.chain;
   }
   return verified;
+}
+
+/**
+ * Single-quotes a path for a POSIX shell. A single quote inside the path is written
+ * as '\'' (close the quote, an escaped quote, reopen), so the hint is copy-paste safe.
+ */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * The one startup boundary: every failure of the constructor leaves as a
+ * NonceRegistryLockError with an operator message. A raw storage error (EIO,
+ * ENOSPC, ...) is wrapped, so a restart never refuses with a bare errno.
+ */
+function startupError(registryPath: string, error: unknown): NonceRegistryLockError {
+  if (error instanceof NonceRegistryLockError) {
+    return error;
+  }
+  const reason = error instanceof Error ? error.message : String(error);
+  return new NonceRegistryLockError(
+    `UsedNonceRegistry: startup could not complete for ${registryPath} (${reason}). Nothing ` +
+      `was signed by this start. Fix the storage error, then restart.`
+  );
 }
 
 /** Writes every byte, looping over short writes */
