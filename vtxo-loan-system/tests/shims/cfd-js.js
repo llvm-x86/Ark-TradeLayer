@@ -125,7 +125,12 @@ function signWithAux(privHex, messageHex, auxHex) {
   const mBuf = asBuf(messageHex);
   const aux = asBuf(auxHex);
   const Ppoint = compressedFromPoint(ecc.pointFromScalar(dBuf));
-  const t = xor32(scalarFromBuf(dBuf), scalarFromBuf(taggedHash("BIP0340/aux", aux)));
+  // BIP-340 default signing: the XOR mask uses the even-Y normalized secret key
+  // (d = n - d' when P has odd Y), not the raw key. Using the raw key produced
+  // valid but non-canonical signatures for every odd-Y key.
+  const d0 = scalarFromBuf(dBuf);
+  const dEven = Ppoint[0] === 0x03 ? N - d0 : d0;
+  const t = xor32(dEven, scalarFromBuf(taggedHash("BIP0340/aux", aux)));
   const rand = taggedHash("BIP0340/nonce", toBuf32(t), Ppoint.slice(1), mBuf);
   const k = scalarFromBuf(rand) % N;
   if (k === 0n) throw new Error("invalid derived nonce");

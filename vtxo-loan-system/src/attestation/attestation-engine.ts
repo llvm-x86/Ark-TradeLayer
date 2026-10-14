@@ -7,6 +7,7 @@
 
 import { BitcoinNetwork } from "bitcoin-networks";
 import { timingSafeEqual } from "crypto";
+import { inspect } from "util";
 import {
   deriveSchnorrPublicKey,
   schnorrSign,
@@ -858,6 +859,18 @@ export class AttestationEngine {
     if (!announcement.oraclePublicKey.equals(this.oraclePublicKey)) {
       throw new Error("Announcement oracle key does not match this engine's key");
     }
+    // Maturity gate (every attest* path goes through here, before any nonce is
+    // derived or recorded): signing an outcome before the event matures
+    // discloses it early and consumes the nonce, so the wrong value could never
+    // be corrected. verifyAttestation already refuses premature attestations;
+    // the signer must refuse to create them.
+    const now = Math.floor(Date.now() / 1000);
+    if (announcement.maturityTime > now) {
+      throw new Error(
+        `Refusing to attest event ${announcement.eventId}: maturity ${announcement.maturityTime} ` +
+          `is in the future (now ${now})`
+      );
+    }
     if (!this.outcomesMatchDescriptor(announcement.descriptor, outcomes)) {
       throw new Error(
         `Outcomes [${outcomes.join(", ")}] do not match the announcement descriptor`
@@ -959,6 +972,11 @@ export class AttestationEngine {
       if (!Number.isSafeInteger(announcement.maturityTime) || announcement.maturityTime <= 0) {
         return false;
       }
+      // Nonce points are x-only 32-byte values (explicit, in addition to the
+      // announcement signature and the per-signature R equality check).
+      if (announcement.noncePoints.some((p) => !Buffer.isBuffer(p) || p.length !== 32)) {
+        return false;
+      }
 
       // (e) Reject premature attestations (maturity in the future)
       const now = Math.floor(Date.now() / 1000);
@@ -1057,5 +1075,28 @@ export class AttestationEngine {
       throw new Error("Attestation engine not initialized");
     }
     return this.oraclePublicKey;
+  }
+
+  /**
+   * Engine objects reach logs through console.log, util.inspect, error
+   * reporters and JSON serializers. The oracle private key (and the key
+   * material behind keyProvider) must never appear in any of them, so each
+   * view is redacted to the public key.
+   */
+  toJSON(): Record<string, unknown> {
+    return this.redactedView();
+  }
+
+  [inspect.custom](): string {
+    return `AttestationEngine ${JSON.stringify(this.redactedView())}`;
+  }
+
+  private redactedView(): Record<string, unknown> {
+    return {
+      network: this.network.name,
+      keyProvider: this.keyProvider.getProviderType(),
+      oraclePublicKey: this.oraclePublicKey ? this.oraclePublicKey.toString("hex") : null,
+      privateKey: "[REDACTED]",
+    };
   }
 }

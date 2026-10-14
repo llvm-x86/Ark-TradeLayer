@@ -343,10 +343,21 @@ describe("oracle attestation core (PR suite)", () => {
 
   it("14. verifyAttestation rejects premature attestations", async () => {
     const engine = await makeEngine();
-    const future = Math.floor(Date.now() / 1000) + 10_000;
-    const announcement = await engine.createAnnouncement("future-event", NUMERIC_SIGNED, future);
-    const attestation = await engine.attestNumeric(announcement, 12.34);
-    expect(engine.verifyAttestation(announcement, attestation)).toBe(false);
+    const maturity = MATURITY_TIME;
+    const announcement = await engine.createAnnouncement("future-event", NUMERIC_SIGNED, maturity);
+    // The signer refuses to sign before maturity, so sign with the clock past
+    // maturity, then verify the same attestation with the clock before it.
+    const clock = jest.spyOn(Date, "now");
+    try {
+      clock.mockReturnValue((maturity + 1) * 1000);
+      const attestation = await engine.attestNumeric(announcement, 12.34);
+      clock.mockReturnValue((maturity - 10_000) * 1000);
+      expect(engine.verifyAttestation(announcement, attestation)).toBe(false);
+      clock.mockReturnValue((maturity + 1) * 1000);
+      expect(engine.verifyAttestation(announcement, attestation)).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("15. verifyAttestation returns false (never throws) on malformed input", async () => {

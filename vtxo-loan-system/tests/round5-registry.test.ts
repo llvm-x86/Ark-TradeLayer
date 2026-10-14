@@ -61,7 +61,7 @@ describe("R5-1: the registry never persists the base nonce point", () => {
       precision: 0,
       signed: true,
     };
-    const announcement = await engine.createAnnouncement(eventId, descriptor, 1_900_000_000);
+    const announcement = await engine.createAnnouncement(eventId, descriptor, 1767225600 /* 2026-01-01T00:00:00Z: matured, signing refuses future events */);
     await engine.attestNumeric(announcement, 42);
 
     const base: string[] = [];
@@ -114,7 +114,7 @@ describe("R5-3: colliding nonce indices are refused at announcement", () => {
       signed: false,
     };
     await expect(
-      engine.createAnnouncement("r5-collision", descriptor, 1_900_000_000)
+      engine.createAnnouncement("r5-collision", descriptor, 1767225600 /* 2026-01-01T00:00:00Z: matured, signing refuses future events */)
     ).rejects.toThrow(/Nonce index collision/);
     engine.close();
   });
@@ -127,8 +127,8 @@ describe("R5-3b: a 31-bit index collision across two events cannot share a nonce
     // Both events get the same base point P; the tweak binds the eventId, so k differs.
     (engine as any).computeNonceDerivationIndex = () => 7;
     const binary = { type: AttestationType.BINARY, outcomes: ["yes", "no"] };
-    const a = await engine.createAnnouncement("r5-cross-a", binary as any, 1_900_000_000);
-    const b = await engine.createAnnouncement("r5-cross-b", binary as any, 1_900_000_000);
+    const a = await engine.createAnnouncement("r5-cross-a", binary as any, 1767225600 /* 2026-01-01T00:00:00Z: matured, signing refuses future events */);
+    const b = await engine.createAnnouncement("r5-cross-b", binary as any, 1767225600 /* 2026-01-01T00:00:00Z: matured, signing refuses future events */);
     expect(a.noncePoints[0]!.equals(b.noncePoints[0]!)).toBe(false);
     await expect(engine.attestBinary(a, true)).resolves.toBeDefined();
     await expect(engine.attestBinary(b, true)).resolves.toBeDefined();
@@ -158,7 +158,7 @@ describe("R5-5: a failed directory fsync after the log rename cannot sign early"
     const announcement = await engine.createAnnouncement(
       "r5-fsync",
       { type: AttestationType.BINARY, outcomes: ["yes", "no"] },
-      1_900_000_000
+      1767225600 /* 2026-01-01T00:00:00Z: matured, signing refuses future events */
     );
 
     // The first directory fsync after this point is the log commit's.
