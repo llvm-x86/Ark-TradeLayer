@@ -41,15 +41,19 @@
  *    before each commit. A symlink that resolves to the registry is handled by
  *    guarantee 1.
  *
- * 4. HISTORY IS A CHAINED LOG WITH AN ANCHOR (readVerifiedLog, load). Records are
- *    appended to a digest chain: chain[i] = sha256(chain[i-1] || sha256(nonceId
+ * 4. HISTORY IS A CHAINED LOG WITH AN ANCHOR (readVerifiedLog, load, save). Records
+ *    are appended to a digest chain: chain[i] = sha256(chain[i-1] || sha256(nonceId
  *    || eventId || messageHash)). The anchor file `<registry>.anchor` records the
  *    chain tip last committed. On start, the anchor must equal the tip of the
- *    verified log, or be a strict prefix of it. A strict extension means the
- *    process stopped after committing the log and before updating the anchor;
- *    the extension is accepted and the anchor is advanced. A log that is shorter
- *    than the anchor, or diverges from it, is refused. A registry whose anchor is
- *    missing while the log has records is also refused.
+ *    verified log, or be exactly one entry behind it. One entry behind means the
+ *    process stopped after committing the log and before updating the anchor; that
+ *    entry is accepted and the anchor is advanced. Two or more entries ahead of the
+ *    anchor is refused, because no crash can produce it. The anchor is caught up
+ *    before the next log commit, so a failed anchor write cannot let the log run
+ *    ahead in the same process either. A log that is shorter than the anchor, or
+ *    diverges from it, is refused. A registry whose anchor is missing while the log
+ *    has records is also refused. Both files are read through one descriptor
+ *    opened with O_NOFOLLOW, and must be regular single-link files.
  *
  * 5. DURABLE COMMITS (replaceFileDurably). The log is committed by writing a
  *    temporary file, fsyncing it, renaming it over the registry, and fsyncing the
@@ -77,6 +81,24 @@
  * 6. NO IN-MEMORY-ONLY MODE OUTSIDE DEVELOPMENT. `persistPath: null` is only
  *    accepted with an explicit `allowInMemory: true` opt-in (the attestation
  *    engine only grants it in development mode on non-mainnet networks).
+ *
+ * 7. THE LOCK IS RELEASED ON EVERY CLEAN EXIT (installShutdownHooks). The lock is
+ *    removed by close(), by process 'exit', and by SIGINT/SIGTERM when this module
+ *    is the only listener for that signal (the handler then re-raises the signal
+ *    with default disposition). Releasing is safe at those points because every
+ *    commit is synchronous: when a hook runs, nothing is half-committed and no
+ *    further signature can be produced by this process. A process that is
+ *    SIGKILLed, OOM-killed or power-cut keeps its lock (guarantee 2).
+ *
+ * NOT ENFORCED:
+ *  - Network filesystems (NFS, SMB, FUSE-remote) are unsupported. O_EXCL
+ *    exclusivity, rename atomicity and directory fsync are not guaranteed across
+ *    clients there, so two hosts can both acquire the lock.
+ *  - Keyed anchor (declined). Keying the anchor with an HMAC would stop forging a
+ *    new history, but it would have to use a secret held beside the log, so
+ *    whoever can read it can also forge it. It cannot stop rollback to an older
+ *    consistent snapshot of the log and anchor together. Only an external
+ *    monotonic counter can, and this module does not have one.
  */
 
 import * as crypto from "crypto";
@@ -181,6 +203,10 @@ export class UsedNonceRegistry {
   private lock: HeldLock | null = null;
   /** True while in-memory records may not yet be durably committed */
   private uncommitted = false;
+  /** Chain tip of the log last committed to disk (what the anchor must record) */
+  private committedTip: string | null = null;
+  /** True while the anchor on disk lags the committed log */
+  private anchorStale = false;
 
   constructor(options: UsedNonceRegistryOptions = {}) {
     const requested =
@@ -206,8 +232,12 @@ export class UsedNonceRegistry {
 
     // Single acquisition point for the writer lock.
     this.lock = acquireLock(this.registryPath);
+    heldInstances.add(this);
+    installShutdownHooks();
     try {
       this.load();
+      // load() leaves the in-memory log equal to the verified on-disk log.
+      this.committedTip = this.tip();
     } catch (e) {
       // Nothing was committed by a failed start (the anchor is only ever
       // advanced after successful verification), so releasing the lock cannot
@@ -248,8 +278,8 @@ export class UsedNonceRegistry {
         );
       }
       // Identical (eventId, message): re-signing is safe once the record is
-      // durable. If an earlier commit failed, retry it before answering.
-      if (this.uncommitted) {
+      // durable. If an earlier log or anchor commit failed, retry it first.
+      if (this.uncommitted || this.anchorStale) {
         this.save();
       }
       return;
@@ -323,6 +353,7 @@ export class UsedNonceRegistry {
       return true;
     }
     this.lock = null;
+    heldInstances.delete(this);
     const stillHeld = isSameFile(lock.lockPath, lock.dev, lock.ino);
     fs.closeSync(lock.fd);
     if (stillHeld) {
@@ -342,11 +373,11 @@ export class UsedNonceRegistry {
   private load(): void {
     const registry = this.registryPath!;
     const anchor = readAnchor(this.anchorPath!);
-    const registryExists = lstatOrNull(registry) !== null;
+    const logText = readSingleLinkFile(registry);
+    const registryExists = logText !== null;
 
-    if (registryExists) {
-      assertSingleLink(registry);
-      for (const entry of readVerifiedLog(registry)) {
+    if (logText !== null) {
+      for (const entry of parseVerifiedLog(logText, registry)) {
         this.entries.set(entry.nonceId, { eventId: entry.eventId, messageHash: entry.messageHash });
         this.log.push(entry);
       }
@@ -390,9 +421,19 @@ export class UsedNonceRegistry {
           `Refusing to continue (nonce reuse would leak the oracle key).`
       );
     }
+    if (tipIndex < this.log.length - 2) {
+      // The anchor is written after every log commit, so a crash leaves it at most
+      // one entry behind. Two or more entries ahead is not a crash: refuse.
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: ${registry} is more than one entry ahead of its history anchor ` +
+          `${this.anchorPath}. Refusing to adopt it: the anchor is only one commit behind after ` +
+          `a crash, so this log was extended or the anchor was rolled back. Restore the ` +
+          `matching anchor from backup, then restart.`
+      );
+    }
     if (tipIndex < this.log.length - 1) {
       // A crash after the log commit and before the anchor update: the log is
-      // a strict extension of the anchored history. Accept it and advance the anchor.
+      // exactly one entry past the anchored history. Accept it and advance the anchor.
       this.assertLockHeld();
       replaceFileDurably(this.anchorPath!, anchorBody(this.tip()), () => this.assertLockHeld());
     }
@@ -413,15 +454,31 @@ export class UsedNonceRegistry {
       return;
     }
 
-    const payload: PersistedShape = { version: LOG_FORMAT_VERSION, entries: this.log };
-    const body = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
-    replaceFileDurably(this.registryPath, body, () => {
-      this.assertLockHeld();
-      assertSingleLink(this.registryPath!);
-    });
-    this.uncommitted = false;
+    // Catch the anchor up before the log may move again, so the log never runs
+    // more than one commit ahead of the anchor, even if anchor writes keep failing.
+    if (this.anchorStale) {
+      this.commitAnchor();
+    }
+    if (this.uncommitted) {
+      const payload: PersistedShape = { version: LOG_FORMAT_VERSION, entries: this.log };
+      const body = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
+      replaceFileDurably(this.registryPath, body, () => {
+        this.assertLockHeld();
+        assertSingleLink(this.registryPath!);
+      });
+      this.uncommitted = false;
+      this.committedTip = this.tip();
+      this.anchorStale = true;
+    }
+    if (this.anchorStale) {
+      this.commitAnchor();
+    }
+  }
 
-    replaceFileDurably(this.anchorPath!, anchorBody(this.tip()), () => this.assertLockHeld());
+  /** Writes the anchor for the last committed log tip */
+  private commitAnchor(): void {
+    replaceFileDurably(this.anchorPath!, anchorBody(this.committedTip), () => this.assertLockHeld());
+    this.anchorStale = false;
   }
 }
 
@@ -467,6 +524,46 @@ function canonicalRegistryPath(requested: string): string {
   return path.join(fs.realpathSync.native(path.dirname(absolute)), path.basename(absolute));
 }
 
+/** Instances that currently hold a lock in this process */
+const heldInstances = new Set<UsedNonceRegistry>();
+let shutdownHooksInstalled = false;
+
+/** Releases every lock this process holds (synchronous; safe in exit handlers) */
+function releaseAllHeld(): void {
+  for (const instance of [...heldInstances]) {
+    try {
+      instance.close();
+    } catch {
+      // the lock was already lost; nothing to release
+    }
+  }
+}
+
+/**
+ * Guarantee 7: release on clean exit. A SIGINT/SIGTERM is handled only when this
+ * module is the sole listener: the handler then releases the locks and re-raises
+ * the signal with default disposition, so the process terminates right away. When
+ * other listeners exist the application owns shutdown and must call close().
+ */
+function installShutdownHooks(): void {
+  if (shutdownHooksInstalled) {
+    return;
+  }
+  shutdownHooksInstalled = true;
+  process.on("exit", releaseAllHeld);
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    const onSignal = (): void => {
+      if (process.listenerCount(signal) !== 1) {
+        return;
+      }
+      process.removeListener(signal, onSignal);
+      releaseAllHeld();
+      process.kill(process.pid, signal);
+    };
+    process.on(signal, onSignal);
+  }
+}
+
 /**
  * Creates `<registryPath>.lock` exclusively. This is the only place a lock is
  * taken. An existing lock is never reclaimed: the error explains how an
@@ -483,9 +580,12 @@ function acquireLock(registryPath: string): HeldLock {
         `UsedNonceRegistry: ${registryPath} is locked: ${lockPath} exists${describeLockHolder(
           lockPath
         )}. Refusing to start: two writers could sign with the same derived nonce and leak ` +
-          `the oracle key. Locks are never taken over automatically. If a crashed process left ` +
-          `this lock, confirm that no process uses this registry, then remove ${lockPath} and ` +
-          `restart. The history anchor still detects truncation after removal.`
+          `the oracle key. Locks are never taken over automatically. A lock is left only by a ` +
+          `process that was killed with SIGKILL, ran out of memory, or lost power. To recover: ` +
+          `(1) confirm that no signer process is running against this registry (for example ` +
+          `\`ps aux | grep -i oracle\` and check the recorded pid); (2) run ` +
+          `\`rm -- '${lockPath}'\`; (3) restart. The removal does not touch the history or the ` +
+          `anchor, and both are re-verified on restart.`
       );
     }
     throw new NonceRegistryLockError(
@@ -570,14 +670,50 @@ function assertSingleLink(registryPath: string): void {
   }
 }
 
+/**
+ * Reads a regular, single-link file through one descriptor opened with
+ * O_NOFOLLOW. The type and link count are checked on that descriptor, so the
+ * bytes returned are the bytes of the checked file (no lstat-then-read window).
+ * Returns null when the file does not exist.
+ */
+function readSingleLinkFile(filePath: string): string | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return null;
+    }
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: cannot open ${filePath} without following links: ${(e as Error).message}` +
+        ` (a symlink here is refused)`
+    );
+  }
+  try {
+    const st = fs.fstatSync(fd, { bigint: true });
+    if (!st.isFile() || st.nlink !== 1n) {
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: ${filePath} must be a regular file with exactly one hard link ` +
+          `(found ${st.isFile() ? `${st.nlink} links` : "a non-regular file"}); refusing to ` +
+          `read or persist nonce state through an alias.`
+      );
+    }
+    return fs.readFileSync(fd, "utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /** Reads the anchor. null = no anchor file. */
 function readAnchor(anchorPath: string): { tip: string | null } | null {
-  if (lstatOrNull(anchorPath) === null) {
+  const text = readSingleLinkFile(anchorPath);
+  if (text === null) {
     return null;
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fs.readFileSync(anchorPath, "utf8"));
+    parsed = JSON.parse(text);
   } catch (e) {
     throw new NonceRegistryLockError(
       `UsedNonceRegistry: cannot read history anchor ${anchorPath}: ${(e as Error).message}`
@@ -607,10 +743,10 @@ function anchorBody(tip: string | null): Buffer {
  * truncation, reordering, rewriting, malformed entries, and duplicate nonces
  * (a valid log never contains two records for one nonce).
  */
-function readVerifiedLog(registryPath: string): LogEntry[] {
+function parseVerifiedLog(text: string, registryPath: string): LogEntry[] {
   let parsed: PersistedShape;
   try {
-    parsed = JSON.parse(fs.readFileSync(registryPath, "utf8")) as PersistedShape;
+    parsed = JSON.parse(text) as PersistedShape;
   } catch (e) {
     throw new NonceRegistryLockError(
       `UsedNonceRegistry: cannot read ${registryPath}: ${(e as Error).message}`
@@ -682,8 +818,9 @@ function fsyncDirectory(dir: string): void {
  */
 function replaceFileDurably(target: string, body: Buffer, beforeCommit: () => void): void {
   const tmp = `${target}.tmp`;
-  // Leftover of an interrupted write. Only the lock holder writes here, and
-  // the lock is verified below before every commit.
+  // The lock is verified before the first byte is written, and again before the rename.
+  beforeCommit();
+  // Leftover of an interrupted write. Only the lock holder writes here.
   const leftover = lstatOrNull(tmp);
   if (leftover !== null) {
     fs.unlinkSync(tmp);

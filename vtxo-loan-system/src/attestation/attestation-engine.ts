@@ -1021,6 +1021,15 @@ export class AttestationEngine {
   }
 
   /**
+   * Releases the used-nonce registry's single-writer lock. The engine must not
+   * sign after this. Shutdown paths should call it; a clean process exit and
+   * SIGINT/SIGTERM release the lock too (see used-nonce-registry.ts, guarantee 7).
+   */
+  close(): void {
+    this.usedNonces.close();
+  }
+
+  /**
    * Gets the oracle's public key
    */
   getPublicKey(): Buffer {

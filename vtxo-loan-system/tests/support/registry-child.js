@@ -4,9 +4,11 @@
  * usage: node registry-child.js <registryPath> <mode>
  *
  * Modes:
- *   record  - open the registry, record a nonce, then exit WITHOUT close()
- *             (simulates a crash: the lockfile must remain)
+ *   record  - open the registry, record a nonce, then SIGKILL itself: no exit
+ *             handler runs, so the lockfile remains (a true crash)
  *   hold    - open the registry, record a nonce, announce HELD, stay alive
+ *   exit    - record a nonce, announce RECORDED, then process.exit(0) without close()
+ *             (a clean exit: the lockfile must be released)
  *   open    - open the registry and announce OPENED (fails loudly on refusal)
  *   race    - wait until the absolute time <startAtMs> (argv[4]), then open the
  *             registry and record the SAME nonce with event "race-<pid>"; announce
@@ -43,7 +45,7 @@ try {
   if (mode === "record") {
     registry.checkAndRecord("aa".repeat(32), "event-child", "bb".repeat(32));
     console.log("RECORDED");
-    process.exit(0); // crash-style exit: no close(), lockfile stays
+    process.kill(process.pid, "SIGKILL"); // true crash: no exit hook, lockfile stays
   }
 
   if (mode === "hold") {
@@ -51,6 +53,12 @@ try {
     console.log("HELD");
     setTimeout(() => process.exit(0), 10_000);
     return;
+  }
+
+  if (mode === "exit") {
+    registry.checkAndRecord("ee".repeat(32), "event-exit", "ff".repeat(32));
+    console.log("RECORDED");
+    process.exit(0);
   }
 
   if (mode === "open") {

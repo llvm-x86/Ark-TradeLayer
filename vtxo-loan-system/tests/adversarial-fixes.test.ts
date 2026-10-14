@@ -168,7 +168,14 @@ describe("fix 1: used-nonce registry is fail-closed", () => {
   it("never takes over a crashed writer's lock; operator removal restores full history", () => {
     const registryPath = tmpPath();
     // Child records a nonce and exits WITHOUT close() (crash semantics).
-    const out = runChild("record", registryPath);
+    let out = "";
+    try {
+      runChild("record", registryPath);
+    } catch (e) {
+      // the child SIGKILLs itself after recording: a true crash, no exit hook
+      expect((e as { signal?: string }).signal).toBe("SIGKILL");
+      out = String((e as { stdout?: unknown }).stdout);
+    }
     expect(out).toContain("RECORDED");
 
     // The stale lock blocks startup, whatever its contents.

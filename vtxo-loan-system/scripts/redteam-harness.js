@@ -150,6 +150,17 @@ async function expectReject(fn, pattern, message) {
   throw new Error(`${message}: no error thrown`);
 }
 
+/** Runs the child that records a nonce and SIGKILLs itself; returns its stdout */
+function runCrashingChild(registryPath) {
+  try {
+    execFileSync(process.execPath, [CHILD, registryPath, "record"], { cwd: ROOT, encoding: "utf8" });
+  } catch (e) {
+    if (e.signal !== "SIGKILL") throw e;
+    return String(e.stdout);
+  }
+  throw new Error("crash child was expected to be killed by SIGKILL");
+}
+
 async function main() {
   const vectors = JSON.parse(
     fs.readFileSync(path.join(ROOT, "tests", "vectors", "attestation-vectors.json"), "utf8")
@@ -287,10 +298,7 @@ async function main() {
     // startup (never taken over); once the operator removes it, history
     // survives and reuse is still refused
     const crashPath = tmpRegistry();
-    const out = execFileSync(process.execPath, [CHILD, crashPath, "record"], {
-      cwd: ROOT,
-      encoding: "utf8",
-    });
+    const out = runCrashingChild(crashPath);
     assert(/RECORDED/.test(out), "child did not record");
     expectThrow(
       () => new UsedNonceRegistry({ persistPath: crashPath }),
@@ -310,7 +318,7 @@ async function main() {
 
     // (b) tail truncation is detected against the lockfile's history anchor
     const truncatePath = tmpRegistry();
-    execFileSync(process.execPath, [CHILD, truncatePath, "record"], { cwd: ROOT });
+    runCrashingChild(truncatePath);
     fs.unlinkSync(`${truncatePath}.lock`); // operator clears the crashed writer's lock
     const truncatable = new UsedNonceRegistry({ persistPath: truncatePath });
     truncatable.close();
@@ -325,7 +333,7 @@ async function main() {
 
     // (c) deletion of the registry behind its anchor is detected
     const deletePath = tmpRegistry();
-    execFileSync(process.execPath, [CHILD, deletePath, "record"], { cwd: ROOT });
+    runCrashingChild(deletePath);
     fs.unlinkSync(`${deletePath}.lock`);
     fs.unlinkSync(deletePath);
     expectThrow(
