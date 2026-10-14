@@ -63,10 +63,12 @@ describe("R3-1: a failed anchor write cannot let the log run ahead", () => {
     registry.checkAndRecord("22".repeat(32), "event-2", "bb".repeat(32));
     registry.close();
 
-    // The refused record 3 was never signed, but it was not un-recorded either: it
-    // is committed with the retry. Recording more than was signed is the safe side.
+    // Record 3 was refused before it was recorded (R6-1: a new record is added only
+    // to a fully committed log), so the retry commits record 2 alone. Record 3 was
+    // never signed and can still be recorded later.
     const restarted = new UsedNonceRegistry({ persistPath: registryPath });
-    expect(restarted.size).toBe(3);
+    expect(restarted.size).toBe(2);
+    expect(restarted.get("33".repeat(32))).toBeUndefined();
     restarted.close();
   });
 });

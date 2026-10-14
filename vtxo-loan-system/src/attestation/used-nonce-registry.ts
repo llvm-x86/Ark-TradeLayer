@@ -64,9 +64,11 @@
  *    their directory fsyncs to have succeeded. The rename is the point where the
  *    in-memory state records the new log tip (the file is then on disk, even if
  *    the directory fsync that follows fails). The anchor is marked stale at that
- *    point, and it is caught up before any further log commit. So after a failed
- *    commit the log is still at most one entry ahead of the anchor, and a retry
- *    of a recorded nonce re-commits the anchor before it answers.
+ *    point, and it is caught up before any further log commit. A record that a
+ *    failed commit left pending is committed before a new record is added, so each
+ *    log commit writes at most one entry. So after any failed commit the log is at
+ *    most one entry ahead of the anchor, and a retry of a recorded nonce re-commits
+ *    the anchor before it answers.
  *
  * LIMITS (not enforced here):
  *  - The anchor is unkeyed. Whoever can write the registry directory can rewrite
@@ -134,6 +136,8 @@ const ANCHOR_FORMAT_VERSION = 1;
 /** Chain seed of the append-only log (the "previous chain" of entry 0) */
 const GENESIS_DIGEST = "0".repeat(64);
 const HEX_DIGEST = /^[0-9a-f]{64}$/;
+/** Same rule as hashEventId (printable ASCII, 1 to 255 characters), enforced for every record */
+const EVENT_ID = /^[\x20-\x7e]{1,255}$/;
 
 /** A recorded nonce usage */
 export interface NonceRecord {
@@ -285,6 +289,9 @@ export class UsedNonceRegistry {
         "UsedNonceRegistry: nonceId and messageHash must be 32-byte lowercase hex strings"
       );
     }
+    if (!EVENT_ID.test(eventId)) {
+      throw new Error("UsedNonceRegistry: eventId must be 1 to 255 printable ASCII characters");
+    }
     const existing = this.entries.get(nonceId);
     if (existing) {
       if (existing.eventId !== eventId) {
@@ -300,11 +307,15 @@ export class UsedNonceRegistry {
             `would leak the oracle key)`
         );
       }
-      // Identical (eventId, message): re-signing is safe once the record is
-      // durable. If an earlier log or anchor commit failed, retry it first.
-      if (this.uncommitted || this.anchorStale) {
-        this.save();
-      }
+    }
+    // Commit whatever an earlier failed commit left pending (a no-op when nothing
+    // is pending). A new record is only added to a fully committed log, so each
+    // commit writes at most one entry. Otherwise one commit could write several
+    // entries, and if its anchor write then failed, the log would be two entries
+    // ahead of the anchor and the next start would refuse it.
+    this.save();
+    if (existing) {
+      // Identical (eventId, message): the record is durable now, so re-signing is safe.
       return;
     }
 
@@ -792,9 +803,13 @@ function parseVerifiedLog(text: string, registryPath: string): LogEntry[] {
     throw new NonceRegistryLockError(
       `UsedNonceRegistry: ${registryPath} is a format-version-2 registry. Version 2 stored the ` +
         `secret-derived base nonce point, so with any published attestation for these events ` +
-        `the oracle private key can be computed. Refusing to start. Treat the oracle key as ` +
-        `compromised: rotate it, and move this registry and its anchor out of the way ` +
-        `(do not delete the old files until the key rotation is complete).`
+        `the oracle private key can be computed. Refusing to start. Do NOT restart with the ` +
+        `same oracle key: a fresh registry under that key would sign nonces already used, ` +
+        `which leaks the key. First check whether this file came from the pre-R5 build: a ` +
+        `file written by an attacker is refused the same way. If any attestation was published ` +
+        `for an event recorded here, the oracle key is compromised: rotate it. Only after that, ` +
+        `move this registry and its anchor aside, and keep both until the rotation is complete ` +
+        `(they contain base points).`
     );
   }
   if (parsed.version !== LOG_FORMAT_VERSION) {
@@ -815,7 +830,8 @@ function parseVerifiedLog(text: string, registryPath: string): LogEntry[] {
       typeof entry.messageHash !== "string" ||
       typeof entry.chain !== "string" ||
       !HEX_DIGEST.test(entry.nonceId) ||
-      !HEX_DIGEST.test(entry.messageHash)
+      !HEX_DIGEST.test(entry.messageHash) ||
+      !EVENT_ID.test(entry.eventId)
     ) {
       throw new NonceRegistryLockError(
         `UsedNonceRegistry: ${registryPath} contains a malformed entry; refusing to continue.`

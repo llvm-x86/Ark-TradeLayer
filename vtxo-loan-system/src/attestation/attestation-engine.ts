@@ -482,6 +482,16 @@ export function scaleValueByPrecision(value: AttestableValue, precision: number)
 }
 
 /**
+ * True when no two nonce points are equal. A repeated point means one signing
+ * nonce k serves two indices, which leaks the oracle key once both are signed.
+ * Shared by createAnnouncement (refuse to publish) and verifyAttestation (refuse
+ * to accept).
+ */
+function hasDistinctNoncePoints(noncePoints: Buffer[]): boolean {
+  return new Set(noncePoints.map((r) => r.toString("hex"))).size === noncePoints.length;
+}
+
+/**
  * Main attestation engine for DLC operations
  */
 export class AttestationEngine {
@@ -703,7 +713,7 @@ export class AttestationEngine {
     }
     // The 31-bit index can collide within one event. Two indices with one
     // nonce point would sign with one k, so refuse to announce such an event.
-    if (new Set(noncePoints.map((r) => r.toString("hex"))).size !== noncePoints.length) {
+    if (!hasDistinctNoncePoints(noncePoints)) {
       throw new Error(
         `Nonce index collision for event ${eventId}: refusing to announce it (use another eventId)`
       );
@@ -977,6 +987,9 @@ export class AttestationEngine {
       const noncesNeeded = this.calculateNoncesNeeded(announcement.descriptor);
       if (announcement.noncePoints.length !== noncesNeeded) {
         return false;
+      }
+      if (!hasDistinctNoncePoints(announcement.noncePoints)) {
+        return false; // a repeated nonce point means a key-leaking announcement
       }
       if (
         attestation.outcomes.length !== noncesNeeded ||
