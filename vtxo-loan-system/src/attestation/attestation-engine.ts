@@ -859,6 +859,15 @@ export class AttestationEngine {
     if (!announcement.oraclePublicKey.equals(this.oraclePublicKey)) {
       throw new Error("Announcement oracle key does not match this engine's key");
     }
+    // The gate below reads announcement.maturityTime from the caller's object. That field is
+    // only trustworthy if this engine's own signature over the canonical announcement (which
+    // covers maturityTime) verifies, so the announcement is authenticated first. A caller-edited
+    // announcement, for example with a past maturity, is refused before any nonce is derived.
+    if (!this.isIssuedAnnouncement(announcement, this.oraclePublicKey)) {
+      throw new Error(
+        `Refusing to attest event ${announcement.eventId}: the announcement is not signed by this engine's oracle key`
+      );
+    }
     // Maturity gate (every attest* path goes through here, before any nonce is
     // derived or recorded): signing an outcome before the event matures
     // discloses it early and consumes the nonce, so the wrong value could never
@@ -913,6 +922,33 @@ export class AttestationEngine {
       signatures,
       attestationTime: Math.floor(Date.now() / 1000),
     };
+  }
+
+  /**
+   * True when the announcement carries a valid signature by oracleKey over its canonical
+   * message. Any malformed field makes the check fail (never throw out of it).
+   */
+  private isIssuedAnnouncement(announcement: EventAnnouncement, oracleKey: Buffer): boolean {
+    try {
+      if (!Number.isSafeInteger(announcement.maturityTime) || announcement.maturityTime <= 0) {
+        return false;
+      }
+      if (!Buffer.isBuffer(announcement.announcementSignature) || announcement.announcementSignature.length !== 64) {
+        return false;
+      }
+      const announcementHash = hashAnnouncement(
+        serializeAnnouncementMessage(
+          announcement.eventId,
+          announcement.oraclePublicKey,
+          announcement.descriptor,
+          announcement.maturityTime,
+          announcement.noncePoints
+        )
+      );
+      return schnorrVerify(oracleKey, announcementHash, announcement.announcementSignature);
+    } catch (error) {
+      return false;
+    }
   }
 
   /**
