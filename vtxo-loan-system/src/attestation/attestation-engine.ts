@@ -589,19 +589,25 @@ export class AttestationEngine {
   }
 
   /**
-   * Computes the k-value (signing nonce) for an event
-   * 
-   * k = privkey_base + H(R_base || eventId)
-   * 
-   * This ensures deterministic, unique nonces per event. Both fields of the
-   * tweak preimage are length-prefixed (see deriveNonceTweak).
+   * Derives the signing nonce for (eventId, index).
+   *
+   * Let P be the base point of the derived nonce key. Then
+   *   t = deriveNonceTweak(P, eventId),  k = oracleKey + t,  R = k*G.
+   * R is the nonce commitment announced for the index and is public. P is
+   * secret-derived and must never be stored or published: with P, anyone can
+   * compute t, and one published signature s = k + e*oracleKey (up to BIP-340
+   * sign conventions) then gives oracleKey = (s - t) / (1 + e). For this reason
+   * the used-nonce registry is keyed by R, never by P.
    */
-  private async computeKValue(eventId: string, index: number): Promise<Buffer> {
+  private async deriveSigningNonce(
+    eventId: string,
+    index: number
+  ): Promise<{ k: Buffer; R: Buffer }> {
     const noncePrivKey = await this.deriveNonceKey(eventId, index);
-    const noncePoint = deriveSchnorrPublicKey(noncePrivKey);
-    const tweak = deriveNonceTweak(noncePoint, eventId);
-
-    return tweakPrivateKey(this.oraclePrivateKey!, tweak);
+    const basePoint = deriveSchnorrPublicKey(noncePrivKey);
+    const tweak = deriveNonceTweak(basePoint, eventId);
+    const k = tweakPrivateKey(this.oraclePrivateKey!, tweak);
+    return { k, R: deriveSchnorrPublicKey(k) };
   }
 
   /**
@@ -692,9 +698,15 @@ export class AttestationEngine {
 
     // Generate nonce commitments (R-values)
     for (let i = 0; i < noncesNeeded; i++) {
-      const kValue = await this.computeKValue(eventId, i);
-      const rValue = deriveSchnorrPublicKey(kValue);
-      noncePoints.push(rValue);
+      const { R } = await this.deriveSigningNonce(eventId, i);
+      noncePoints.push(R);
+    }
+    // The 31-bit index can collide within one event. Two indices with one
+    // nonce point would sign with one k, so refuse to announce such an event.
+    if (new Set(noncePoints.map((r) => r.toString("hex"))).size !== noncePoints.length) {
+      throw new Error(
+        `Nonce index collision for event ${eventId}: refusing to announce it (use another eventId)`
+      );
     }
 
     // Serialize announcement for signing (canonical, length-prefixed)
@@ -858,22 +870,17 @@ export class AttestationEngine {
       );
       const messageHash = hashAttestation(message);
 
-      // Registry check (H1): refuse if this derived nonce was already used.
-      const noncePrivKey = await this.deriveNonceKey(announcement.eventId, i);
-      const noncePoint = deriveSchnorrPublicKey(noncePrivKey);
+      // Derive first (no side effects), then record (R, eventId, message) in the
+      // registry, then sign. The record and the signature are separated by no
+      // await, so no other event-loop callback (including a signal handler) can
+      // run between a durable record and the signature it authorizes.
+      const { k, R } = await this.deriveSigningNonce(announcement.eventId, i);
       this.usedNonces.checkAndRecord(
-        noncePoint.toString("hex"),
+        R.toString("hex"),
         announcement.eventId,
         messageHash.toString("hex")
       );
-
-      const kValue = await this.computeKValue(announcement.eventId, i);
-      const signature = schnorrSignWithNonce(
-        this.oraclePrivateKey,
-        messageHash,
-        kValue
-      );
-      signatures.push(signature);
+      signatures.push(schnorrSignWithNonce(this.oraclePrivateKey, messageHash, k));
     }
 
     return {

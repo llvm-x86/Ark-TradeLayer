@@ -10,9 +10,11 @@
  * derivation itself is deterministic: if it were ever weakened, reset, or
  * collided, this registry is the fail-closed backstop.
  *
- * Policy: a derived nonce may only ever sign one (eventId, messageHash) pair.
- * Reuse for a DIFFERENT eventId - or for a different message under the same
- * eventId - is refused.
+ * Policy: a signing nonce k may only ever sign one (eventId, messageHash) pair.
+ * The registry identifies k by its public point R (`nonceId`). Reuse for a
+ * DIFFERENT eventId - or for a different message under the same eventId - is
+ * refused. Identical (eventId, messageHash) may be signed again: the signature is
+ * then identical and reveals nothing new.
  *
  * Guarantees, each enforced by the named function:
  *
@@ -57,11 +59,14 @@
  *
  * 5. DURABLE COMMITS (replaceFileDurably). The log is committed by writing a
  *    temporary file, fsyncing it, renaming it over the registry, and fsyncing the
- *    directory. The commit happens BEFORE the caller gets a success result, so a
- *    nonce is never signed unless its record is durable. Any failure, including
- *    a failed directory fsync, is raised. A failed commit leaves the registry
- *    marked uncommitted, and every later attempt to reuse a record re-commits
- *    first.
+ *    directory. A nonce is never signed unless save() returned normally, which
+ *    requires the log rename and the anchor rename to have both completed and
+ *    their directory fsyncs to have succeeded. The rename is the point where the
+ *    in-memory state records the new log tip (the file is then on disk, even if
+ *    the directory fsync that follows fails). The anchor is marked stale at that
+ *    point, and it is caught up before any further log commit. So after a failed
+ *    commit the log is still at most one entry ahead of the anchor, and a retry
+ *    of a recorded nonce re-commits the anchor before it answers.
  *
  * LIMITS (not enforced here):
  *  - The anchor is unkeyed. Whoever can write the registry directory can rewrite
@@ -90,6 +95,16 @@
  *    further signature can be produced by this process. A process that is
  *    SIGKILLed, OOM-killed or power-cut keeps its lock (guarantee 2).
  *
+ * 8. NO SECRET IN THE LOG. `nonceId` is the public nonce point R that the oracle
+ *    announces for an (event, index). The registry must never receive the base
+ *    point P of the derived nonce key: the signing nonce is k = oracleKey +
+ *    deriveNonceTweak(P, eventId), so P and one published signature reveal the
+ *    oracle key (see deriveSigningNonce in attestation-engine.ts). Logs in format
+ *    version 2, which stored P, are refused at startup. Their records cannot be
+ *    migrated, because the registry does not hold the oracle key to recompute R,
+ *    and any published attestation for those events already exposes the oracle
+ *    key.
+ *
  * NOT ENFORCED:
  *  - Network filesystems (NFS, SMB, FUSE-remote) are unsupported. O_EXCL
  *    exclusivity, rename atomicity and directory fsync are not guaranteed across
@@ -109,8 +124,11 @@ import * as path from "path";
 /** Default on-disk location of the used-nonce registry */
 export const DEFAULT_NONCE_REGISTRY_PATH = "data/used-nonces.json";
 
-/** Version of the persisted log format */
-const LOG_FORMAT_VERSION = 2;
+/**
+ * Version of the persisted log format. Version 2 stored the secret-derived base
+ * nonce point; version 3 stores the public nonce point (see guarantee 8).
+ */
+const LOG_FORMAT_VERSION = 3;
 /** Version of the anchor file format */
 const ANCHOR_FORMAT_VERSION = 1;
 /** Chain seed of the append-only log (the "previous chain" of entry 0) */
@@ -146,7 +164,7 @@ export class NonceRegistryLockError extends Error {
 
 /** A single append-only log entry */
 interface LogEntry {
-  /** Hex identifier of the derived nonce (its public point) */
+  /** Hex x-only public nonce point R of the signing nonce (never the base point) */
   nonceId: string;
   /** Event the nonce was used for */
   eventId: string;
@@ -257,11 +275,16 @@ export class UsedNonceRegistry {
    * otherwise, and throws if the record cannot be committed. The caller must
    * not sign unless this returns normally.
    *
-   * @param nonceId - Hex identifier of the derived nonce (its public point)
+   * @param nonceId - Hex x-only public nonce point R = k*G of the signing nonce (public, never P)
    * @param eventId - Event being signed
    * @param messageHash - Hex digest being signed
    */
   checkAndRecord(nonceId: string, eventId: string, messageHash: string): void {
+    if (!HEX_DIGEST.test(nonceId) || !HEX_DIGEST.test(messageHash)) {
+      throw new Error(
+        "UsedNonceRegistry: nonceId and messageHash must be 32-byte lowercase hex strings"
+      );
+    }
     const existing = this.entries.get(nonceId);
     if (existing) {
       if (existing.eventId !== eventId) {
@@ -462,13 +485,21 @@ export class UsedNonceRegistry {
     if (this.uncommitted) {
       const payload: PersistedShape = { version: LOG_FORMAT_VERSION, entries: this.log };
       const body = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
-      replaceFileDurably(this.registryPath, body, () => {
-        this.assertLockHeld();
-        assertSingleLink(this.registryPath!);
-      });
-      this.uncommitted = false;
-      this.committedTip = this.tip();
-      this.anchorStale = true;
+      replaceFileDurably(
+        this.registryPath,
+        body,
+        () => {
+          this.assertLockHeld();
+          assertSingleLink(this.registryPath!);
+        },
+        () => {
+          // The rename is the commit point. If the directory fsync below fails,
+          // the new log is still on disk, so the anchor must be treated as stale.
+          this.uncommitted = false;
+          this.committedTip = this.tip();
+          this.anchorStale = true;
+        }
+      );
     }
     if (this.anchorStale) {
       this.commitAnchor();
@@ -757,6 +788,21 @@ function parseVerifiedLog(text: string, registryPath: string): LogEntry[] {
       `UsedNonceRegistry: ${registryPath} has a malformed payload; refusing to continue.`
     );
   }
+  if (parsed.version === 2) {
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: ${registryPath} is a format-version-2 registry. Version 2 stored the ` +
+        `secret-derived base nonce point, so with any published attestation for these events ` +
+        `the oracle private key can be computed. Refusing to start. Treat the oracle key as ` +
+        `compromised: rotate it, and move this registry and its anchor out of the way ` +
+        `(do not delete the old files until the key rotation is complete).`
+    );
+  }
+  if (parsed.version !== LOG_FORMAT_VERSION) {
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: ${registryPath} has unsupported format version ${String(parsed.version)}; ` +
+        `refusing to continue.`
+    );
+  }
 
   const verified: LogEntry[] = [];
   const seen = new Set<string>();
@@ -767,7 +813,9 @@ function parseVerifiedLog(text: string, registryPath: string): LogEntry[] {
       typeof entry.nonceId !== "string" ||
       typeof entry.eventId !== "string" ||
       typeof entry.messageHash !== "string" ||
-      typeof entry.chain !== "string"
+      typeof entry.chain !== "string" ||
+      !HEX_DIGEST.test(entry.nonceId) ||
+      !HEX_DIGEST.test(entry.messageHash)
     ) {
       throw new NonceRegistryLockError(
         `UsedNonceRegistry: ${registryPath} contains a malformed entry; refusing to continue.`
@@ -814,9 +862,16 @@ function fsyncDirectory(dir: string): void {
 /**
  * Atomically replaces `target` with `body`: temp file, fsync, the
  * `beforeCommit` re-check, rename, directory fsync. Throws on any failure, and
- * the commit is only complete when it returns normally.
+ * the commit is only complete when it returns normally. `onRenamed` runs right
+ * after the rename succeeds and before the directory fsync, so a caller can
+ * record that the new file is in place even if the fsync then throws.
  */
-function replaceFileDurably(target: string, body: Buffer, beforeCommit: () => void): void {
+function replaceFileDurably(
+  target: string,
+  body: Buffer,
+  beforeCommit: () => void,
+  onRenamed: () => void = () => {}
+): void {
   const tmp = `${target}.tmp`;
   // The lock is verified before the first byte is written, and again before the rename.
   beforeCommit();
@@ -836,6 +891,8 @@ function replaceFileDurably(target: string, body: Buffer, beforeCommit: () => vo
     fs.fsyncSync(fd);
     beforeCommit();
     fs.renameSync(tmp, target);
+    // Immediately after the rename, before anything else that can throw.
+    onRenamed();
   } catch (e) {
     fs.closeSync(fd);
     if (lstatOrNull(tmp) !== null) {
