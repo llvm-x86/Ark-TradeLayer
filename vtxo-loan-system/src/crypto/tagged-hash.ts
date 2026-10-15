@@ -127,6 +127,16 @@ export function assertPrintableAscii(text: string, what: string): void {
   }
 }
 
+/** True when assertPrintableAscii accepts the text (the boolean form, for validators) */
+export function isPrintableAsciiId(text: string): boolean {
+  try {
+    assertPrintableAscii(text, "identifier");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Canonical 32-byte event id commitment: sha256(utf8(eventId)).
  *

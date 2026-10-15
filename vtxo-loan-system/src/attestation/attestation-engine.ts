@@ -17,7 +17,6 @@ import {
 } from "../crypto/bitcoin-primitives";
 import {
   DLC_TAGS,
-  assertPrintableAscii,
   concatLengthPrefixed,
   createTaggedHash,
   deriveNonceTweak,
@@ -25,6 +24,7 @@ import {
   hashAnnouncement,
   hashAttestation,
   hashEventId,
+  isPrintableAsciiId,
 } from "../crypto/tagged-hash";
 import { KeyProvider } from "../keys/key-provider";
 import { inspectRedacted, redactedView } from "../redaction";
@@ -231,16 +231,7 @@ export function isValidDescriptor(descriptor: EventDescriptor): boolean {
         Number.isInteger(numDigits) &&
         numDigits >= 1 &&
         numDigits <= 64 &&
-        typeof unit === "string" &&
-        unit.length > 0 &&
-        (() => {
-          try {
-            assertPrintableAscii(unit, "unit");
-            return true;
-          } catch {
-            return false;
-          }
-        })() &&
+        isPrintableAsciiId(unit) &&
         Number.isInteger(precision) &&
         precision >= 0 &&
         precision <= 18 &&
@@ -252,19 +243,9 @@ export function isValidDescriptor(descriptor: EventDescriptor): boolean {
       return (
         Array.isArray(outcomes) &&
         outcomes.length === 2 &&
-        typeof outcomes[0] === "string" &&
-        typeof outcomes[1] === "string" &&
-        outcomes[0].length > 0 &&
         outcomes[0] !== outcomes[1] &&
-        (() => {
-          try {
-            assertPrintableAscii(outcomes[0]!, "outcome label");
-            assertPrintableAscii(outcomes[1]!, "outcome label");
-            return true;
-          } catch {
-            return false;
-          }
-        })()
+        isPrintableAsciiId(outcomes[0]!) &&
+        isPrintableAsciiId(outcomes[1]!)
       );
     }
     case AttestationType.ENUM: {
@@ -274,12 +255,7 @@ export function isValidDescriptor(descriptor: EventDescriptor): boolean {
       }
       const seen = new Set<string>();
       for (const outcome of outcomes) {
-        if (typeof outcome !== "string" || outcome.length === 0 || seen.has(outcome)) {
-          return false;
-        }
-        try {
-          assertPrintableAscii(outcome, "outcome label");
-        } catch {
+        if (!isPrintableAsciiId(outcome) || seen.has(outcome)) {
           return false;
         }
         seen.add(outcome);
