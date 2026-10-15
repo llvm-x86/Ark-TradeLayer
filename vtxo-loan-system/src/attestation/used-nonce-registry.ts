@@ -123,6 +123,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
+import { isPrintableAsciiId } from "../crypto/tagged-hash";
+
 /** Default on-disk location of the used-nonce registry */
 export const DEFAULT_NONCE_REGISTRY_PATH = "data/used-nonces.json";
 
@@ -136,8 +138,6 @@ const ANCHOR_FORMAT_VERSION = 1;
 /** Chain seed of the append-only log (the "previous chain" of entry 0) */
 const GENESIS_DIGEST = "0".repeat(64);
 const HEX_DIGEST = /^[0-9a-f]{64}$/;
-/** Same rule as hashEventId (printable ASCII, 1 to 255 characters), enforced for every record */
-const EVENT_ID = /^[\x20-\x7e]{1,255}$/;
 
 /** A recorded nonce usage */
 export interface NonceRecord {
@@ -292,7 +292,7 @@ export class UsedNonceRegistry {
         "UsedNonceRegistry: nonceId and messageHash must be 32-byte lowercase hex strings"
       );
     }
-    if (!EVENT_ID.test(eventId)) {
+    if (!isPrintableAsciiId(eventId)) {
       throw new Error("UsedNonceRegistry: eventId must be 1 to 255 printable ASCII characters");
     }
     const existing = this.entries.get(nonceId);
@@ -433,8 +433,7 @@ export class UsedNonceRegistry {
       // No history yet (first start, or a log without records): establish the
       // anchor before any commit, so that a crash during the first commit
       // cannot look like a deleted anchor.
-      this.assertLockHeld();
-      replaceFileDurably(this.anchorPath!, anchorBody(null), () => this.assertLockHeld());
+      this.commitFile(this.anchorPath!, anchorBody(null));
       return;
     }
 
@@ -471,8 +470,7 @@ export class UsedNonceRegistry {
     if (tipIndex < this.log.length - 1) {
       // A crash after the log commit and before the anchor update: the log is
       // exactly one entry past the anchored history. Accept it and advance the anchor.
-      this.assertLockHeld();
-      replaceFileDurably(this.anchorPath!, anchorBody(this.tip()), () => this.assertLockHeld());
+      this.commitFile(this.anchorPath!, anchorBody(this.tip()));
     }
   }
 
@@ -499,21 +497,13 @@ export class UsedNonceRegistry {
     if (this.uncommitted) {
       const payload: PersistedShape = { version: LOG_FORMAT_VERSION, entries: this.log };
       const body = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
-      replaceFileDurably(
-        this.registryPath,
-        body,
-        () => {
-          this.assertLockHeld();
-          assertSingleLink(this.registryPath!);
-        },
-        () => {
-          // The rename is the commit point. If the directory fsync below fails,
-          // the new log is still on disk, so the anchor must be treated as stale.
-          this.uncommitted = false;
-          this.committedTip = this.tip();
-          this.anchorStale = true;
-        }
-      );
+      this.commitFile(this.registryPath, body, () => {
+        // The rename is the commit point. If the directory fsync below fails,
+        // the new log is still on disk, so the anchor must be treated as stale.
+        this.uncommitted = false;
+        this.committedTip = this.tip();
+        this.anchorStale = true;
+      });
     }
     if (this.anchorStale) {
       this.commitAnchor();
@@ -522,8 +512,49 @@ export class UsedNonceRegistry {
 
   /** Writes the anchor for the last committed log tip */
   private commitAnchor(): void {
-    replaceFileDurably(this.anchorPath!, anchorBody(this.committedTip), () => this.assertLockHeld());
+    this.commitFile(this.anchorPath!, anchorBody(this.committedTip));
     this.anchorStale = false;
+  }
+
+  /**
+   * The one durable write of this module (the log and the anchor both use it).
+   * Before the temp file is written and again before the rename, this instance
+   * re-verifies the lock and that the target is a single-link regular file.
+   * `onRenamed` runs right after the rename, before the directory fsync, so a
+   * caller can record that the new file is in place even if the fsync throws.
+   */
+  private commitFile(target: string, body: Buffer, onRenamed: () => void = () => {}): void {
+    const verify = (): void => {
+      this.assertLockHeld();
+      assertSingleLink(target);
+    };
+    verify();
+    const tmp = `${target}.tmp`;
+    // Leftover of an interrupted write. Only the lock holder writes here.
+    if (lstatOrNull(tmp) !== null) {
+      fs.unlinkSync(tmp);
+    }
+
+    const fd = fs.openSync(
+      tmp,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600
+    );
+    try {
+      writeAll(fd, body);
+      fs.fsyncSync(fd);
+      verify();
+      fs.renameSync(tmp, target);
+      onRenamed();
+    } catch (e) {
+      fs.closeSync(fd);
+      if (lstatOrNull(tmp) !== null) {
+        fs.unlinkSync(tmp);
+      }
+      throw e;
+    }
+    fs.closeSync(fd);
+    fsyncDirectory(path.dirname(target));
   }
 }
 
@@ -700,18 +731,26 @@ function lstatOrNull(filePath: string): fs.BigIntStats | null {
   }
 }
 
-/** The registry must be a regular file with exactly one hard link */
-function assertSingleLink(registryPath: string): void {
-  const st = lstatOrNull(registryPath);
-  if (st === null) {
-    return;
-  }
+/**
+ * The one single-link rule: a nonce-state file must be a regular file with exactly
+ * one hard link. Applied to the lstat of a path (before a write) and to the fstat
+ * of an open descriptor (before a read).
+ */
+function assertSingleLinkStat(filePath: string, st: fs.BigIntStats): void {
   if (!st.isFile() || st.nlink !== 1n) {
     throw new NonceRegistryLockError(
-      `UsedNonceRegistry: ${registryPath} must be a regular file with exactly one hard link ` +
+      `UsedNonceRegistry: ${filePath} must be a regular file with exactly one hard link ` +
         `(found ${st.isFile() ? `${st.nlink} links` : "a non-regular file"}); refusing to ` +
         `read or persist nonce state through an alias.`
     );
+  }
+}
+
+/** Single-link check of the file currently at `filePath`, if any */
+function assertSingleLink(filePath: string): void {
+  const st = lstatOrNull(filePath);
+  if (st !== null) {
+    assertSingleLinkStat(filePath, st);
   }
 }
 
@@ -739,14 +778,7 @@ function readSingleLinkFile(filePath: string): string | null {
     throw e;
   }
   try {
-    const st = fs.fstatSync(fd, { bigint: true });
-    if (!st.isFile() || st.nlink !== 1n) {
-      throw new NonceRegistryLockError(
-        `UsedNonceRegistry: ${filePath} must be a regular file with exactly one hard link ` +
-          `(found ${st.isFile() ? `${st.nlink} links` : "a non-regular file"}); refusing to ` +
-          `read or persist nonce state through an alias.`
-      );
-    }
+    assertSingleLinkStat(filePath, fs.fstatSync(fd, { bigint: true }));
     return fs.readFileSync(fd, "utf8");
   } finally {
     fs.closeSync(fd);
@@ -837,7 +869,7 @@ function parseVerifiedLog(text: string, registryPath: string): LogEntry[] {
       typeof entry.chain !== "string" ||
       !HEX_DIGEST.test(entry.nonceId) ||
       !HEX_DIGEST.test(entry.messageHash) ||
-      !EVENT_ID.test(entry.eventId)
+      !isPrintableAsciiId(entry.eventId)
     ) {
       throw new NonceRegistryLockError(
         `UsedNonceRegistry: ${registryPath} contains a malformed entry; refusing to continue.`
@@ -903,49 +935,4 @@ function fsyncDirectory(dir: string): void {
   } finally {
     fs.closeSync(fd);
   }
-}
-
-/**
- * Atomically replaces `target` with `body`: temp file, fsync, the
- * `beforeCommit` re-check, rename, directory fsync. Throws on any failure, and
- * the commit is only complete when it returns normally. `onRenamed` runs right
- * after the rename succeeds and before the directory fsync, so a caller can
- * record that the new file is in place even if the fsync then throws.
- */
-function replaceFileDurably(
-  target: string,
-  body: Buffer,
-  beforeCommit: () => void,
-  onRenamed: () => void = () => {}
-): void {
-  const tmp = `${target}.tmp`;
-  // The lock is verified before the first byte is written, and again before the rename.
-  beforeCommit();
-  // Leftover of an interrupted write. Only the lock holder writes here.
-  const leftover = lstatOrNull(tmp);
-  if (leftover !== null) {
-    fs.unlinkSync(tmp);
-  }
-
-  const fd = fs.openSync(
-    tmp,
-    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
-    0o600
-  );
-  try {
-    writeAll(fd, body);
-    fs.fsyncSync(fd);
-    beforeCommit();
-    fs.renameSync(tmp, target);
-    // Immediately after the rename, before anything else that can throw.
-    onRenamed();
-  } catch (e) {
-    fs.closeSync(fd);
-    if (lstatOrNull(tmp) !== null) {
-      fs.unlinkSync(tmp);
-    }
-    throw e;
-  }
-  fs.closeSync(fd);
-  fsyncDirectory(path.dirname(target));
 }
