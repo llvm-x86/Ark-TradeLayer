@@ -125,9 +125,6 @@ import * as path from "path";
 
 import { isPrintableAsciiId } from "../crypto/tagged-hash";
 
-/** Default on-disk location of the used-nonce registry */
-export const DEFAULT_NONCE_REGISTRY_PATH = "data/used-nonces.json";
-
 /**
  * Version of the persisted log format. Version 2 stored the secret-derived base
  * nonce point; version 3 stores the public nonce point (see guarantee 8).
@@ -199,10 +196,11 @@ interface HeldLock {
 
 export interface UsedNonceRegistryOptions {
   /**
-   * JSON file to persist to. Omit for the default
-   * ("data/used-nonces.json").
+   * JSON file to persist to. Required: a default path would be resolved against
+   * the working directory, so a restart from another directory would open an
+   * empty registry. Pass null only together with allowInMemory.
    */
-  persistPath?: string | null;
+  persistPath: string | null;
   /**
    * Explicit opt-in for in-memory-only operation (`persistPath: null`).
    * Refused otherwise: a restart of an in-memory registry forgets every
@@ -230,9 +228,14 @@ export class UsedNonceRegistry {
   /** True while the anchor on disk lags the committed log */
   private anchorStale = false;
 
-  constructor(options: UsedNonceRegistryOptions = {}) {
-    const requested =
-      options.persistPath === undefined ? DEFAULT_NONCE_REGISTRY_PATH : options.persistPath;
+  constructor(options: UsedNonceRegistryOptions) {
+    const requested = options.persistPath;
+    if (requested === undefined) {
+      throw new NonceRegistryLockError(
+        "UsedNonceRegistry: persistPath is required (the registry file, or null for in-memory " +
+          "operation). A default path would depend on the working directory."
+      );
+    }
 
     if (requested === null) {
       if (options.allowInMemory !== true) {

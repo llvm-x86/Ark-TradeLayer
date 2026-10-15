@@ -150,13 +150,14 @@ export interface AttestationEngineConfig {
    */
   trustedOraclePublicKey?: string | Buffer;
   /**
-   * JSON file used to persist the used-nonce registry across restarts
-   * (default "data/used-nonces.json"). Pass null for in-memory only - this
-   * is refused unless `developmentMode` is true AND the network is not
-   * mainnet: an in-memory registry forgets every used nonce on restart,
-   * which allows the deterministic derivation to sign twice with the same k.
+   * JSON file used to persist the used-nonce registry across restarts. Required:
+   * a relative default would make the registry depend on the working directory.
+   * Pass null for in-memory only - this is refused unless `developmentMode` is
+   * true AND the network is not mainnet: an in-memory registry forgets every used
+   * nonce on restart, which allows the deterministic derivation to sign twice
+   * with the same k.
    */
-  usedNonceRegistryPath?: string | null;
+  usedNonceRegistryPath: string | null;
   /**
    * Explicit development-mode marker. Only development mode may run with an
    * in-memory nonce registry; mainnet always implies production semantics.
@@ -531,13 +532,25 @@ export class AttestationEngine {
     this.network = config.network;
     this.keyProvider = config.keyProvider;
     this.noncePurpose = config.noncePurpose ?? 585; // BIP-0085 style purpose
-    this.trustedOraclePublicKey = parseOraclePublicKey(config.trustedOraclePublicKey);
+    if (config.trustedOraclePublicKey !== undefined) {
+      this.trustedOraclePublicKey = parseOraclePublicKey(config.trustedOraclePublicKey);
+      if (!this.trustedOraclePublicKey) {
+        throw new Error(
+          "trustedOraclePublicKey must be a 32-byte x-only key (64 hex characters or a 32-byte Buffer)"
+        );
+      }
+    }
 
     // Nonce registry (H1): a single writer per registry file, held for the
     // lifetime of this process. In-memory-only mode is a development-only
     // escape hatch - mainnet always implies production semantics.
-    const registryPath =
-      config.usedNonceRegistryPath === undefined ? undefined : config.usedNonceRegistryPath;
+    const registryPath = config.usedNonceRegistryPath;
+    if (registryPath === undefined) {
+      throw new Error(
+        "usedNonceRegistryPath is required: pass the registry file path, or null for " +
+          "in-memory operation in development"
+      );
+    }
     if (registryPath === null) {
       const developmentAllowed =
         config.developmentMode === true && !isMainnetNetwork(this.network);
@@ -552,9 +565,7 @@ export class AttestationEngine {
       }
       this.usedNonces = new UsedNonceRegistry({ persistPath: null, allowInMemory: true });
     } else {
-      this.usedNonces = new UsedNonceRegistry(
-        registryPath === undefined ? {} : { persistPath: registryPath }
-      );
+      this.usedNonces = new UsedNonceRegistry({ persistPath: registryPath });
     }
   }
 
