@@ -225,14 +225,16 @@ export function apiAuthKeyViolation(authKey: unknown): string | null {
   if (typeof authKey !== "string") {
     return "API_AUTH_KEY must be a string";
   }
-  if (authKey === DEFAULT_API_AUTH_KEY) {
+  // Both rules read the same normalized form: whitespace removed. Comparing the raw
+  // string let "dev-key-insecure " (trailing space) through as a strong key.
+  const significant = authKey.replace(/\s/g, "");
+  if (significant.toLowerCase() === DEFAULT_API_AUTH_KEY) {
     return "API_AUTH_KEY is the insecure default";
   }
-  const significant = authKey.replace(/\s/g, "").length;
-  if (significant < MIN_API_AUTH_KEY_LENGTH) {
+  if (significant.length < MIN_API_AUTH_KEY_LENGTH) {
     return (
       `API_AUTH_KEY must have at least ${MIN_API_AUTH_KEY_LENGTH} non-whitespace ` +
-      `characters (got ${significant})`
+      `characters (got ${significant.length})`
     );
   }
   return null;

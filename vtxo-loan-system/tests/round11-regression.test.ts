@@ -6,6 +6,7 @@
  *  R11-3  a malformed pinned oracle key is refused at construction
  *  R11-4  the anchor is single-link checked on every commit, like the log
  *  R11-5  a witness that would decide without evidence is refused
+ *  R11-6  the insecure API_AUTH_KEY placeholder is refused in any spelling
  */
 import * as fs from "fs";
 import * as os from "os";
@@ -21,7 +22,11 @@ import {
   NonceRegistryLockError,
   UsedNonceRegistry,
 } from "../src/attestation/used-nonce-registry";
-import { loadConfigFromEnv } from "../src/config/system-config";
+import {
+  DEFAULT_API_AUTH_KEY,
+  apiAuthKeyViolation,
+  loadConfigFromEnv,
+} from "../src/config/system-config";
 import { MockKeyProvider } from "../src/keys/key-provider";
 import { BlockchainClient, CompositeWitness, PaymentWitness } from "../src/witness/event-witness";
 
@@ -212,4 +217,21 @@ describe("R11-5: witnesses that cannot decide are refused", () => {
     );
   });
 
+});
+
+describe("R11-6: the insecure API_AUTH_KEY placeholder is refused in any spelling", () => {
+  it("the placeholder with surrounding or inner whitespace is still the insecure default", () => {
+    expect(apiAuthKeyViolation(DEFAULT_API_AUTH_KEY)).toMatch(/insecure default/);
+    expect(apiAuthKeyViolation(`${DEFAULT_API_AUTH_KEY} `)).toMatch(/insecure default/);
+    expect(apiAuthKeyViolation(` ${DEFAULT_API_AUTH_KEY}\n`)).toMatch(/insecure default/);
+    expect(apiAuthKeyViolation("dev-key-insecure\t")).toMatch(/insecure default/);
+  });
+
+  it("the placeholder in another letter case is still the insecure default", () => {
+    expect(apiAuthKeyViolation("DEV-KEY-INSECURE")).toMatch(/insecure default/);
+  });
+
+  it("a different key that merely contains the placeholder is not refused as the default", () => {
+    expect(apiAuthKeyViolation("dev-key-insecure-but-longer")).toBeNull();
+  });
 });
