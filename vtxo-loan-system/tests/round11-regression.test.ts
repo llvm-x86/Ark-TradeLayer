@@ -2,6 +2,7 @@
  * Round-11 regression tests (review of the round-10 tree):
  *
  *  R11-1  the nonce registry path is never implied by the working directory
+ *  R11-2  numeric configuration is parsed strictly, never truncated or NaN
  *  R11-3  a malformed pinned oracle key is refused at construction
  *  R11-4  the anchor is single-link checked on every commit, like the log
  */
@@ -19,6 +20,7 @@ import {
   NonceRegistryLockError,
   UsedNonceRegistry,
 } from "../src/attestation/used-nonce-registry";
+import { loadConfigFromEnv } from "../src/config/system-config";
 import { MockKeyProvider } from "../src/keys/key-provider";
 
 const MNEMONIC = "test test test test test test test test test test test junk";
@@ -64,6 +66,66 @@ describe("R11-1: the nonce registry path is never implied by the working directo
     } finally {
       process.chdir(previous);
     }
+  });
+});
+
+describe("R11-2: numeric configuration is parsed strictly", () => {
+  const KEYS = [
+    "MIN_CONTRACT_VALUE",
+    "VTXO_EXIT_DELAY",
+    "PUBLIC_API_PORT",
+    "REDIS_PORT",
+    "PRICE_CHECK_INTERVAL",
+  ];
+  let saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved = {};
+    for (const key of KEYS) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of KEYS) {
+      if (saved[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = saved[key];
+      }
+    }
+  });
+
+  it("scientific notation is refused, not read as its leading digit", () => {
+    process.env.MIN_CONTRACT_VALUE = "1e4";
+    expect(() => loadConfigFromEnv()).toThrow(/MIN_CONTRACT_VALUE/);
+  });
+
+  it("trailing garbage is refused, not dropped", () => {
+    process.env.VTXO_EXIT_DELAY = "1008abc";
+    expect(() => loadConfigFromEnv()).toThrow(/VTXO_EXIT_DELAY/);
+  });
+
+  it("non-numeric and negative values are refused", () => {
+    process.env.PUBLIC_API_PORT = "abc";
+    expect(() => loadConfigFromEnv()).toThrow(/PUBLIC_API_PORT/);
+    process.env.PUBLIC_API_PORT = "-1";
+    expect(() => loadConfigFromEnv()).toThrow(/PUBLIC_API_PORT/);
+  });
+
+  it("values beyond the safe integer range are refused", () => {
+    process.env.REDIS_PORT = "99999999999999999999";
+    expect(() => loadConfigFromEnv()).toThrow(/REDIS_PORT/);
+  });
+
+  it("plain decimal values (with surrounding whitespace) and defaults still load", () => {
+    process.env.MIN_CONTRACT_VALUE = " 25000 ";
+    process.env.PRICE_CHECK_INTERVAL = "7";
+    const config = loadConfigFromEnv();
+    expect(config.vtxo.minContractValue).toBe(25000);
+    expect(config.scheduler.priceCheckInterval).toBe(7);
+    expect(config.vtxo.defaultExitDelay).toBe(1008);
   });
 });
 

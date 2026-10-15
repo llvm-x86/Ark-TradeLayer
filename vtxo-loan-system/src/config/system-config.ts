@@ -239,6 +239,24 @@ export function apiAuthKeyViolation(authKey: unknown): string | null {
 }
 
 /**
+ * Reads a numeric setting: a plain non-negative decimal integer, surrounding
+ * whitespace allowed. parseInt would read "1e4" as 1, "1008abc" as 1008 and
+ * "abc" as NaN, and a truncated MIN_CONTRACT_VALUE or exit delay is a silent
+ * change of policy, so every numeric setting goes through this one parser.
+ */
+function integerEnv(name: string, fallback: string): number {
+  const raw = process.env[name] || fallback;
+  const text = raw.trim();
+  const value = /^\d+$/.test(text) ? Number(text) : NaN;
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(
+      `${name} must be a non-negative integer, got ${JSON.stringify(process.env[name])}`
+    );
+  }
+  return value;
+}
+
+/**
  * Loads configuration from environment variables.
  *
  * Values are read as given. Enum-valued settings (NETWORK, ORACLE_MODE,
@@ -261,15 +279,15 @@ export function loadConfigFromEnv(): SystemConfig {
   const database: DatabaseConfig = {
     uri: process.env.MONGODB_URI || "mongodb://localhost:27017",
     database: process.env.MONGODB_DATABASE || "vtxo-loans",
-    poolSize: parseInt(process.env.MONGODB_POOL_SIZE || "10"),
+    poolSize: integerEnv("MONGODB_POOL_SIZE", "10"),
   };
 
   // Redis
   const redis: RedisConfig = {
     host: process.env.REDIS_HOST || "127.0.0.1",
-    port: parseInt(process.env.REDIS_PORT || "6379"),
+    port: integerEnv("REDIS_PORT", "6379"),
     password: process.env.REDIS_PASSWORD,
-    db: parseInt(process.env.REDIS_DB || "0"),
+    db: integerEnv("REDIS_DB", "0"),
   };
 
   // External data sources
@@ -295,8 +313,8 @@ export function loadConfigFromEnv(): SystemConfig {
 
   // API server
   const api: ApiConfig = {
-    publicPort: parseInt(process.env.PUBLIC_API_PORT || "3000"),
-    internalPort: parseInt(process.env.INTERNAL_API_PORT || "3001"),
+    publicPort: integerEnv("PUBLIC_API_PORT", "3000"),
+    internalPort: integerEnv("INTERNAL_API_PORT", "3001"),
     authKey: process.env.API_AUTH_KEY || DEFAULT_API_AUTH_KEY,
     cors: {
       enabled: process.env.CORS_ENABLED !== "false",
@@ -313,16 +331,16 @@ export function loadConfigFromEnv(): SystemConfig {
 
   // Scheduler
   const scheduler: SchedulerConfig = {
-    priceCheckInterval: parseInt(process.env.PRICE_CHECK_INTERVAL || "5"),
-    paymentCheckInterval: parseInt(process.env.PAYMENT_CHECK_INTERVAL || "2"),
-    announcementLookahead: parseInt(process.env.ANNOUNCEMENT_LOOKAHEAD || "13"),
+    priceCheckInterval: integerEnv("PRICE_CHECK_INTERVAL", "5"),
+    paymentCheckInterval: integerEnv("PAYMENT_CHECK_INTERVAL", "2"),
+    announcementLookahead: integerEnv("ANNOUNCEMENT_LOOKAHEAD", "13"),
   };
 
   // VTXO
   const vtxo: VtxoConfig = {
-    defaultExitDelay: parseInt(process.env.VTXO_EXIT_DELAY || "1008"),
+    defaultExitDelay: integerEnv("VTXO_EXIT_DELAY", "1008"),
     serverPublicKey: process.env.VTXO_SERVER_PUBKEY || "",
-    minContractValue: parseInt(process.env.MIN_CONTRACT_VALUE || "10000"),
+    minContractValue: integerEnv("MIN_CONTRACT_VALUE", "10000"),
   };
 
   return {
