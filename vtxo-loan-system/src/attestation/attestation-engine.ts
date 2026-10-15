@@ -492,6 +492,52 @@ function hasDistinctNoncePoints(noncePoints: Buffer[]): boolean {
   return new Set(noncePoints.map((r) => r.toString("hex"))).size === noncePoints.length;
 }
 
+/** Maturity is Unix seconds: a safe, positive integer */
+function isValidMaturity(maturityTime: number): boolean {
+  return Number.isSafeInteger(maturityTime) && maturityTime > 0;
+}
+
+/**
+ * The one maturity rule. An event is premature while its maturity lies more than
+ * `toleranceSeconds` after `now`: the signer tolerates nothing, the verifier
+ * tolerates MATURITY_SKEW_SECONDS.
+ */
+function isPremature(maturityTime: number, now: number, toleranceSeconds: number): boolean {
+  return maturityTime > now + toleranceSeconds;
+}
+
+/**
+ * The one announcement-authentication rule: true when the announcement carries a
+ * valid signature by `oracleKey` over its canonical message (which covers
+ * maturityTime and the nonce points). The signer and the verifier both call it.
+ * Any malformed field makes the check fail; it never throws.
+ */
+function isAuthenticAnnouncement(announcement: EventAnnouncement, oracleKey: Buffer): boolean {
+  try {
+    if (!isValidMaturity(announcement.maturityTime)) {
+      return false;
+    }
+    if (
+      !Buffer.isBuffer(announcement.announcementSignature) ||
+      announcement.announcementSignature.length !== 64
+    ) {
+      return false;
+    }
+    const announcementHash = hashAnnouncement(
+      serializeAnnouncementMessage(
+        announcement.eventId,
+        announcement.oraclePublicKey,
+        announcement.descriptor,
+        announcement.maturityTime,
+        announcement.noncePoints
+      )
+    );
+    return schnorrVerify(oracleKey, announcementHash, announcement.announcementSignature);
+  } catch (error) {
+    return false;
+  }
+}
+
 /**
  * Main attestation engine for DLC operations
  */
@@ -700,7 +746,7 @@ export class AttestationEngine {
     // Throws for non-printable-ASCII event ids (would collide under utf8)
     hashEventId(eventId);
     assertValidDescriptor(descriptor);
-    if (!Number.isSafeInteger(maturityTime) || maturityTime <= 0) {
+    if (!isValidMaturity(maturityTime)) {
       throw new Error(`Invalid maturityTime: ${maturityTime}`);
     }
 
@@ -863,7 +909,7 @@ export class AttestationEngine {
     // only trustworthy if this engine's own signature over the canonical announcement (which
     // covers maturityTime) verifies, so the announcement is authenticated first. A caller-edited
     // announcement, for example with a past maturity, is refused before any nonce is derived.
-    if (!this.isIssuedAnnouncement(announcement, this.oraclePublicKey)) {
+    if (!isAuthenticAnnouncement(announcement, this.oraclePublicKey)) {
       throw new Error(
         `Refusing to attest event ${announcement.eventId}: the announcement is not signed by this engine's oracle key`
       );
@@ -874,7 +920,7 @@ export class AttestationEngine {
     // be corrected. verifyAttestation already refuses premature attestations;
     // the signer must refuse to create them.
     const now = Math.floor(Date.now() / 1000);
-    if (announcement.maturityTime > now) {
+    if (isPremature(announcement.maturityTime, now, 0)) {
       throw new Error(
         `Refusing to attest event ${announcement.eventId}: maturity ${announcement.maturityTime} ` +
           `is in the future (now ${now})`
@@ -922,33 +968,6 @@ export class AttestationEngine {
       signatures,
       attestationTime: Math.floor(Date.now() / 1000),
     };
-  }
-
-  /**
-   * True when the announcement carries a valid signature by oracleKey over its canonical
-   * message. Any malformed field makes the check fail (never throw out of it).
-   */
-  private isIssuedAnnouncement(announcement: EventAnnouncement, oracleKey: Buffer): boolean {
-    try {
-      if (!Number.isSafeInteger(announcement.maturityTime) || announcement.maturityTime <= 0) {
-        return false;
-      }
-      if (!Buffer.isBuffer(announcement.announcementSignature) || announcement.announcementSignature.length !== 64) {
-        return false;
-      }
-      const announcementHash = hashAnnouncement(
-        serializeAnnouncementMessage(
-          announcement.eventId,
-          announcement.oraclePublicKey,
-          announcement.descriptor,
-          announcement.maturityTime,
-          announcement.noncePoints
-        )
-      );
-      return schnorrVerify(oracleKey, announcementHash, announcement.announcementSignature);
-    } catch (error) {
-      return false;
-    }
   }
 
   /**
@@ -1005,35 +1024,20 @@ export class AttestationEngine {
         return false;
       }
 
-      if (!Number.isSafeInteger(announcement.maturityTime) || announcement.maturityTime <= 0) {
-        return false;
-      }
       // Nonce points are x-only 32-byte values (explicit, in addition to the
       // announcement signature and the per-signature R equality check).
       if (announcement.noncePoints.some((p) => !Buffer.isBuffer(p) || p.length !== 32)) {
         return false;
       }
 
-      // (e) Reject premature attestations (maturity in the future)
-      const now = Math.floor(Date.now() / 1000);
-      if (announcement.maturityTime > now + MATURITY_SKEW_SECONDS) {
+      // (b) The announcement must be signed by the pinned key over its canonical message
+      if (!isAuthenticAnnouncement(announcement, trusted)) {
         return false;
       }
 
-      // (b) Verify the announcement signature over the canonical message
-      if (announcement.announcementSignature.length !== 64) {
-        return false;
-      }
-      const announcementHash = hashAnnouncement(
-        serializeAnnouncementMessage(
-          announcement.eventId,
-          announcement.oraclePublicKey,
-          announcement.descriptor,
-          announcement.maturityTime,
-          announcement.noncePoints
-        )
-      );
-      if (!schnorrVerify(trusted, announcementHash, announcement.announcementSignature)) {
+      // (e) Reject premature attestations (maturity beyond the clock-skew tolerance)
+      const now = Math.floor(Date.now() / 1000);
+      if (isPremature(announcement.maturityTime, now, MATURITY_SKEW_SECONDS)) {
         return false;
       }
 
