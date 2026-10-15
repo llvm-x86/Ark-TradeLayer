@@ -57,7 +57,7 @@
  *    has records is also refused. Both files are read through one descriptor
  *    opened with O_NOFOLLOW, and must be regular single-link files.
  *
- * 5. DURABLE COMMITS (replaceFileDurably). The log is committed by writing a
+ * 5. DURABLE COMMITS (commitFile). The log is committed by writing a
  *    temporary file, fsyncing it, renaming it over the registry, and fsyncing the
  *    directory. A nonce is never signed unless save() returned normally, which
  *    requires the log rename and the anchor rename to have both completed and

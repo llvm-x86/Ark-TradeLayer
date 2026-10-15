@@ -225,8 +225,8 @@ export function apiAuthKeyViolation(authKey: unknown): string | null {
   if (typeof authKey !== "string") {
     return "API_AUTH_KEY must be a string";
   }
-  // Both rules read the same normalized form: whitespace removed. Comparing the raw
-  // string let "dev-key-insecure " (trailing space) through as a strong key.
+  // Both rules read the same normalized form (whitespace removed), so a placeholder
+  // with stray whitespace or another letter case is still recognized.
   const significant = authKey.replace(/\s/g, "");
   if (significant.toLowerCase() === DEFAULT_API_AUTH_KEY) {
     return "API_AUTH_KEY is the insecure default";
@@ -242,9 +242,8 @@ export function apiAuthKeyViolation(authKey: unknown): string | null {
 
 /**
  * Reads a numeric setting: a plain non-negative decimal integer, surrounding
- * whitespace allowed. parseInt would read "1e4" as 1, "1008abc" as 1008 and
- * "abc" as NaN, and a truncated MIN_CONTRACT_VALUE or exit delay is a silent
- * change of policy, so every numeric setting goes through this one parser.
+ * whitespace allowed. A value such as "1e4" or "1008abc" is refused rather than
+ * truncated, so every numeric setting goes through this one parser.
  */
 function integerEnv(name: string, fallback: string): number {
   const raw = process.env[name] || fallback;
