@@ -35,18 +35,28 @@ const CHILD = path.join(__dirname, "support", "fault-child.js");
 
 jest.setTimeout(900_000);
 
-/** Transpiles the production registry source for the child process (same code, plain node) */
+/**
+ * Transpiles the production registry and the one local module it imports (the
+ * event-id rule in tagged-hash) into a scratch tree with the same relative layout,
+ * so the child loads exactly the production code. node_modules is linked in for
+ * the hash dependency.
+ */
 function compileRegistry(dir: string): string {
-  const out = ts.transpileModule(fs.readFileSync(REGISTRY_SRC, "utf8"), {
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2020,
-      esModuleInterop: true,
-    },
-  });
-  const file = path.join(dir, "used-nonce-registry.js");
-  fs.writeFileSync(file, out.outputText);
-  return file;
+  for (const rel of ["attestation/used-nonce-registry", "crypto/tagged-hash"]) {
+    const src = path.join(__dirname, "..", "src", `${rel}.ts`);
+    const out = ts.transpileModule(fs.readFileSync(src, "utf8"), {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2020,
+        esModuleInterop: true,
+      },
+    });
+    const file = path.join(dir, `${rel}.js`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, out.outputText);
+  }
+  fs.symlinkSync(path.join(__dirname, "..", "node_modules"), path.join(dir, "node_modules"));
+  return path.join(dir, "attestation", "used-nonce-registry.js");
 }
 
 interface Fault {
