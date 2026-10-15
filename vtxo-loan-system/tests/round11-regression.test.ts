@@ -5,6 +5,7 @@
  *  R11-2  numeric configuration is parsed strictly, never truncated or NaN
  *  R11-3  a malformed pinned oracle key is refused at construction
  *  R11-4  the anchor is single-link checked on every commit, like the log
+ *  R11-5  a witness that would decide without evidence is refused
  */
 import * as fs from "fs";
 import * as os from "os";
@@ -22,6 +23,7 @@ import {
 } from "../src/attestation/used-nonce-registry";
 import { loadConfigFromEnv } from "../src/config/system-config";
 import { MockKeyProvider } from "../src/keys/key-provider";
+import { BlockchainClient, CompositeWitness, PaymentWitness } from "../src/witness/event-witness";
 
 const MNEMONIC = "test test test test test test test test test test test junk";
 
@@ -187,3 +189,27 @@ describe("R11-4: the anchor is single-link checked on every commit", () => {
   });
 });
 
+describe("R11-5: witnesses that cannot decide are refused", () => {
+  const blockchain: BlockchainClient = { getTransfers: async () => [] };
+
+  it("a composite witness with no members is refused (it would report satisfied)", () => {
+    expect(() => new CompositeWitness([], "and")).toThrow(/at least one witness/);
+    expect(() => new CompositeWitness([], "or")).toThrow(/at least one witness/);
+  });
+
+  it("a payment witness with a zero or non-finite expected amount is refused", () => {
+    const base = {
+      network: "bitcoin",
+      recipientAddress: "bc1qexample",
+      asset: "BTC",
+      fromBlock: 0,
+    };
+    expect(() => new PaymentWitness({ ...base, expectedAmount: 0 }, blockchain)).toThrow(
+      /expectedAmount must be a positive number/
+    );
+    expect(() => new PaymentWitness({ ...base, expectedAmount: Number.NaN }, blockchain)).toThrow(
+      /expectedAmount must be a positive number/
+    );
+  });
+
+});
