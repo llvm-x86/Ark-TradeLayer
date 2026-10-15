@@ -27,6 +27,7 @@ import {
   hashEventId,
 } from "../crypto/tagged-hash";
 import { KeyProvider } from "../keys/key-provider";
+import { inspectRedacted, redactedView } from "../redaction";
 import { UsedNonceRegistry } from "./used-nonce-registry";
 
 export { NonceRegistryLockError, NonceReuseError, UsedNonceRegistry } from "./used-nonce-registry";
@@ -1124,19 +1125,17 @@ export class AttestationEngine {
    * view is redacted to the public key.
    */
   toJSON(): Record<string, unknown> {
-    return this.redactedView();
+    return redactedView(
+      {
+        network: this.network.name,
+        keyProvider: this.keyProvider.getProviderType(),
+        oraclePublicKey: this.oraclePublicKey ? this.oraclePublicKey.toString("hex") : null,
+      },
+      ["privateKey"]
+    );
   }
 
   [inspect.custom](): string {
-    return `AttestationEngine ${JSON.stringify(this.redactedView())}`;
-  }
-
-  private redactedView(): Record<string, unknown> {
-    return {
-      network: this.network.name,
-      keyProvider: this.keyProvider.getProviderType(),
-      oraclePublicKey: this.oraclePublicKey ? this.oraclePublicKey.toString("hex") : null,
-      privateKey: "[REDACTED]",
-    };
+    return inspectRedacted("AttestationEngine", this.toJSON());
   }
 }

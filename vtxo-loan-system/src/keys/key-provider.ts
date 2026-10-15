@@ -12,16 +12,9 @@ import * as bip39 from "bip39";
 import BIP32Factory, { BIP32Interface } from "bip32";
 import * as ecc from "tiny-secp256k1";
 import { inspect } from "util";
+import { inspectRedacted, redactedView } from "../redaction";
 
 const bip32 = BIP32Factory(ecc);
-
-/**
- * The only view of a key provider that logging, inspection and serialization
- * may see. The HD root (which holds the master private key) is never printed.
- */
-function redactedProviderView(providerType: string): Record<string, string> {
-  return { keyProvider: providerType, secrets: "[REDACTED]" };
-}
 
 /**
  * Key provider interface - all implementations must satisfy this
@@ -122,12 +115,12 @@ export class LocalKeyProvider implements KeyProvider {
     return "local";
   }
 
-  toJSON(): Record<string, string> {
-    return redactedProviderView(this.getProviderType());
+  toJSON(): Record<string, unknown> {
+    return redactedView({ keyProvider: this.getProviderType() }, ["secrets"]);
   }
 
   [inspect.custom](): string {
-    return `LocalKeyProvider ${JSON.stringify(redactedProviderView(this.getProviderType()))}`;
+    return inspectRedacted("LocalKeyProvider", this.toJSON());
   }
 }
 
@@ -246,12 +239,12 @@ export class CloudKeyProvider implements KeyProvider {
     return `cloud-${this.config.provider}`;
   }
 
-  toJSON(): Record<string, string> {
-    return redactedProviderView(this.getProviderType());
+  toJSON(): Record<string, unknown> {
+    return redactedView({ keyProvider: this.getProviderType() }, ["secrets"]);
   }
 
   [inspect.custom](): string {
-    return `CloudKeyProvider ${JSON.stringify(redactedProviderView(this.getProviderType()))}`;
+    return inspectRedacted("CloudKeyProvider", this.toJSON());
   }
 }
 
@@ -290,12 +283,12 @@ export class MockKeyProvider implements KeyProvider {
     return "mock";
   }
 
-  toJSON(): Record<string, string> {
-    return redactedProviderView(this.getProviderType());
+  toJSON(): Record<string, unknown> {
+    return redactedView({ keyProvider: this.getProviderType() }, ["secrets"]);
   }
 
   [inspect.custom](): string {
-    return `MockKeyProvider ${JSON.stringify(redactedProviderView(this.getProviderType()))}`;
+    return inspectRedacted("MockKeyProvider", this.toJSON());
   }
 
   /**
