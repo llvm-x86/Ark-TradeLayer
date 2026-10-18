@@ -196,9 +196,10 @@ interface HeldLock {
 
 export interface UsedNonceRegistryOptions {
   /**
-   * JSON file to persist to. Required: a default path would be resolved against
-   * the working directory, so a restart from another directory would open an
-   * empty registry. Pass null only together with allowInMemory.
+   * Absolute path of the JSON file to persist to. Required: a default or relative
+   * path would be resolved against the working directory, so a restart from
+   * another directory would open an empty registry. Pass null only together with
+   * allowInMemory.
    */
   persistPath: string | null;
   /**
@@ -252,7 +253,6 @@ export class UsedNonceRegistry {
     }
 
     try {
-      fs.mkdirSync(path.dirname(requested), { recursive: true });
       this.registryPath = canonicalRegistryPath(requested);
       this.anchorPath = `${this.registryPath}.anchor`;
       // Single acquisition point for the writer lock.
@@ -579,10 +579,20 @@ function chainDigest(
 }
 
 /**
- * Resolves the registry path to its canonical form. Every spelling of one
- * file (symlinks, `..`, `.`) maps to the same string, so it yields one lock.
+ * The one place the registry path is resolved. Refuses a relative path, creates
+ * the parent directory, and resolves the path to its canonical form. Every
+ * spelling of one file (symlinks, `..`, `.`) maps to the same string, so it
+ * yields one lock.
  */
 function canonicalRegistryPath(requested: string): string {
+  if (!path.isAbsolute(requested)) {
+    throw new NonceRegistryLockError(
+      `UsedNonceRegistry: persistPath must be an absolute path, got ${JSON.stringify(requested)}. ` +
+        "A relative path is resolved against the working directory, so a restart from another " +
+        "directory would open an empty registry and could re-sign a nonce."
+    );
+  }
+  fs.mkdirSync(path.dirname(requested), { recursive: true });
   const absolute = path.resolve(requested);
   try {
     return fs.realpathSync.native(absolute);

@@ -150,8 +150,9 @@ export interface AttestationEngineConfig {
    */
   trustedOraclePublicKey?: string | Buffer;
   /**
-   * JSON file used to persist the used-nonce registry across restarts. Required:
-   * a relative default would make the registry depend on the working directory.
+   * Absolute path of the JSON file that persists the used-nonce registry across
+   * restarts. Required: a relative path would make the registry depend on the
+   * working directory.
    * Pass null for in-memory only - this is refused unless `developmentMode` is
    * true AND the network is not mainnet: an in-memory registry forgets every used
    * nonce on restart, which allows the deterministic derivation to sign twice
