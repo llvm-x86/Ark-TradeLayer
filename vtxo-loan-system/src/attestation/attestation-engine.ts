@@ -1119,7 +1119,7 @@ export class AttestationEngine {
         keyProvider: this.keyProvider.getProviderType(),
         oraclePublicKey: this.oraclePublicKey ? this.oraclePublicKey.toString("hex") : null,
       },
-      ["privateKey"]
+      ["oraclePrivateKey"]
     );
   }
 

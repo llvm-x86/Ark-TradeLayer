@@ -6,6 +6,7 @@
  *  R13-2  a port setting outside 1-65535 is refused when the config loads
  *  R13-3  the configuration carries the registry path, so the documented
  *         startup flow (config -> engine) works and needs an absolute path
+ *  R13-4  each key holder redacts its real secret fields, under their real names
  */
 import * as fs from "fs";
 import * as os from "os";
@@ -15,7 +16,10 @@ import { BitcoinNetworks } from "bitcoin-networks";
 
 import { AttestationEngine } from "../src/attestation/attestation-engine";
 import { UsedNonceRegistry } from "../src/attestation/used-nonce-registry";
-import { MockKeyProvider } from "../src/keys/key-provider";
+import { inspect } from "util";
+import * as util from "util";
+
+import { CloudKeyProvider, LocalKeyProvider, MockKeyProvider } from "../src/keys/key-provider";
 import { loadConfig, loadConfigFromEnv } from "../src/config/system-config";
 
 const MNEMONIC = "test test test test test test test test test test test junk";
@@ -188,5 +192,86 @@ describe("R13-3: the configuration carries the nonce registry path", () => {
     // The engine holds the writer lock of the configured registry.
     expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(/locked/);
     engine.close();
+  });
+});
+
+describe("R13-4: redaction names the real secret fields", () => {
+  const CLOUD = { type: "cloud" as const, provider: "gcp" as const, projectId: "p", secretId: "s" };
+
+  /** The printed forms a secret could leak through: inspect, JSON, and util.format */
+  function printedForms(holder: object): string[] {
+    return [
+      inspect(holder),
+      inspect(holder, { showHidden: true, depth: 6 }),
+      JSON.stringify(holder),
+      util.format("%o", holder),
+      util.format("%O", holder),
+      util.format("%s", holder),
+    ];
+  }
+
+  /** Each secret, as the hex and spaced-byte forms util.inspect may print */
+  function secretSpellings(hex: string): string[] {
+    return [hex, hex.match(/../g)!.join(" ")];
+  }
+
+  it("the local, cloud and mock providers hide their root keys and seed", () => {
+    const local = new LocalKeyProvider(MNEMONIC);
+    const rootHex = (local as any).root.privateKey.toString("hex") as string;
+
+    const cloud = new CloudKeyProvider(CLOUD);
+    (cloud as any).cachedRoot = (local as any).root;
+
+    const mock = new MockKeyProvider(MNEMONIC);
+    const mockRootHex = (mock as any).root.privateKey.toString("hex") as string;
+    const mockSeed = (mock as any).seed as string;
+
+    for (const text of printedForms(local)) {
+      for (const secret of secretSpellings(rootHex)) expect(text.includes(secret)).toBe(false);
+    }
+    expect(JSON.parse(JSON.stringify(local))).toEqual({
+      keyProvider: "local",
+      root: "[REDACTED]",
+    });
+
+    for (const text of printedForms(cloud)) {
+      for (const secret of secretSpellings(rootHex)) expect(text.includes(secret)).toBe(false);
+    }
+    expect(JSON.parse(JSON.stringify(cloud))).toEqual({
+      keyProvider: "cloud-gcp",
+      cachedRoot: "[REDACTED]",
+    });
+
+    for (const text of printedForms(mock)) {
+      expect(text.includes(mockSeed)).toBe(false);
+      for (const secret of secretSpellings(mockRootHex)) expect(text.includes(secret)).toBe(false);
+    }
+    expect(JSON.parse(JSON.stringify(mock))).toEqual({
+      keyProvider: "mock",
+      root: "[REDACTED]",
+      seed: "[REDACTED]",
+    });
+  });
+
+  it("the engine hides its oracle private key under its real field name", async () => {
+    const registryPath = path.join(tmpDir("r13-redact-"), "used-nonces.json");
+    const engine = new AttestationEngine({
+      network: BitcoinNetworks.bitcoin_regtest,
+      keyProvider: new MockKeyProvider(MNEMONIC),
+      usedNonceRegistryPath: registryPath,
+      developmentMode: true,
+    });
+    try {
+      await engine.initialize();
+      const oracleHex = (engine as any).oraclePrivateKey.toString("hex") as string;
+      for (const text of printedForms(engine)) {
+        for (const secret of secretSpellings(oracleHex)) expect(text.includes(secret)).toBe(false);
+      }
+      expect(JSON.parse(JSON.stringify(engine))).toMatchObject({
+        oraclePrivateKey: "[REDACTED]",
+      });
+    } finally {
+      engine.close();
+    }
   });
 });

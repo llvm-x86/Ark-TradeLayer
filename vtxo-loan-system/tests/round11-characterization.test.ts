@@ -161,13 +161,13 @@ describe("C2: redaction output of every key holder", () => {
     const cloud = new CloudKeyProvider({ type: "cloud", provider: "gcp", projectId: "p", secretId: "s" });
     const mock = new MockKeyProvider(MNEMONIC);
 
-    expect(JSON.stringify(local)).toBe('{"keyProvider":"local","secrets":"[REDACTED]"}');
-    expect(JSON.stringify(cloud)).toBe('{"keyProvider":"cloud-gcp","secrets":"[REDACTED]"}');
-    expect(JSON.stringify(mock)).toBe('{"keyProvider":"mock","secrets":"[REDACTED]"}');
+    expect(JSON.stringify(local)).toBe('{"keyProvider":"local","root":"[REDACTED]"}');
+    expect(JSON.stringify(cloud)).toBe('{"keyProvider":"cloud-gcp","cachedRoot":"[REDACTED]"}');
+    expect(JSON.stringify(mock)).toBe('{"keyProvider":"mock","root":"[REDACTED]","seed":"[REDACTED]"}');
 
-    expect(inspect(local)).toBe('LocalKeyProvider {"keyProvider":"local","secrets":"[REDACTED]"}');
-    expect(inspect(cloud)).toBe('CloudKeyProvider {"keyProvider":"cloud-gcp","secrets":"[REDACTED]"}');
-    expect(inspect(mock)).toBe('MockKeyProvider {"keyProvider":"mock","secrets":"[REDACTED]"}');
+    expect(inspect(local)).toBe('LocalKeyProvider {"keyProvider":"local","root":"[REDACTED]"}');
+    expect(inspect(cloud)).toBe('CloudKeyProvider {"keyProvider":"cloud-gcp","cachedRoot":"[REDACTED]"}');
+    expect(inspect(mock)).toBe('MockKeyProvider {"keyProvider":"mock","root":"[REDACTED]","seed":"[REDACTED]"}');
     for (const text of [inspect(local), JSON.stringify(local)]) {
       expect(text).not.toContain("test test");
     }
@@ -181,7 +181,7 @@ describe("C2: redaction output of every key holder", () => {
         network: "bitcoin_regtest",
         keyProvider: "mock",
         oraclePublicKey: publicKey,
-        privateKey: "[REDACTED]",
+        oraclePrivateKey: "[REDACTED]",
       })
     );
     expect(inspect(engine)).toBe(
@@ -189,7 +189,7 @@ describe("C2: redaction output of every key holder", () => {
         network: "bitcoin_regtest",
         keyProvider: "mock",
         oraclePublicKey: publicKey,
-        privateKey: "[REDACTED]",
+        oraclePrivateKey: "[REDACTED]",
       })}`
     );
     engine.close();

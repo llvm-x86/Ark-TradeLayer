@@ -9,7 +9,8 @@ export const REDACTED = "[REDACTED]";
 
 /**
  * The one redacted view: publicFields are printed as given, and every name in
- * secretFields is printed as REDACTED.
+ * secretFields is printed as REDACTED. Each secret name must be the holder's real
+ * field name: a name that matches no field hides nothing.
  */
 export function redactedView(
   publicFields: Record<string, unknown>,

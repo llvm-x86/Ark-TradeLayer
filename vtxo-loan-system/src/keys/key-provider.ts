@@ -116,7 +116,7 @@ export class LocalKeyProvider implements KeyProvider {
   }
 
   toJSON(): Record<string, unknown> {
-    return redactedView({ keyProvider: this.getProviderType() }, ["secrets"]);
+    return redactedView({ keyProvider: this.getProviderType() }, ["root"]);
   }
 
   [inspect.custom](): string {
@@ -240,7 +240,7 @@ export class CloudKeyProvider implements KeyProvider {
   }
 
   toJSON(): Record<string, unknown> {
-    return redactedView({ keyProvider: this.getProviderType() }, ["secrets"]);
+    return redactedView({ keyProvider: this.getProviderType() }, ["cachedRoot"]);
   }
 
   [inspect.custom](): string {
@@ -284,7 +284,7 @@ export class MockKeyProvider implements KeyProvider {
   }
 
   toJSON(): Record<string, unknown> {
-    return redactedView({ keyProvider: this.getProviderType() }, ["secrets"]);
+    return redactedView({ keyProvider: this.getProviderType() }, ["root", "seed"]);
   }
 
   [inspect.custom](): string {
