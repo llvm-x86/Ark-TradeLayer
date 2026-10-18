@@ -240,18 +240,26 @@ export function apiAuthKeyViolation(authKey: unknown): string | null {
   return null;
 }
 
+/** Range of a port number: 0 is not a port, and no port exceeds 65535 */
+const PORT_RANGE = { min: 1, max: 65535 } as const;
+
 /**
- * Reads a numeric setting: a plain non-negative decimal integer, surrounding
+ * Reads a numeric setting: a plain decimal integer within [min, max], surrounding
  * whitespace allowed. A value such as "1e4" or "1008abc" is refused rather than
- * truncated, so every numeric setting goes through this one parser.
+ * truncated, and a value outside the range is refused rather than loaded, so every
+ * numeric setting goes through this one parser with its own range.
  */
-function integerEnv(name: string, fallback: string): number {
+function integerEnv(
+  name: string,
+  fallback: string,
+  { min = 0, max = Number.MAX_SAFE_INTEGER }: { min?: number; max?: number } = {}
+): number {
   const raw = process.env[name] || fallback;
   const text = raw.trim();
   const value = /^\d+$/.test(text) ? Number(text) : NaN;
-  if (!Number.isSafeInteger(value)) {
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
     throw new Error(
-      `${name} must be a non-negative integer, got ${JSON.stringify(process.env[name])}`
+      `${name} must be an integer from ${min} to ${max}, got ${JSON.stringify(process.env[name])}`
     );
   }
   return value;
@@ -286,7 +294,7 @@ export function loadConfigFromEnv(): SystemConfig {
   // Redis
   const redis: RedisConfig = {
     host: process.env.REDIS_HOST || "127.0.0.1",
-    port: integerEnv("REDIS_PORT", "6379"),
+    port: integerEnv("REDIS_PORT", "6379", PORT_RANGE),
     password: process.env.REDIS_PASSWORD,
     db: integerEnv("REDIS_DB", "0"),
   };
@@ -314,8 +322,8 @@ export function loadConfigFromEnv(): SystemConfig {
 
   // API server
   const api: ApiConfig = {
-    publicPort: integerEnv("PUBLIC_API_PORT", "3000"),
-    internalPort: integerEnv("INTERNAL_API_PORT", "3001"),
+    publicPort: integerEnv("PUBLIC_API_PORT", "3000", PORT_RANGE),
+    internalPort: integerEnv("INTERNAL_API_PORT", "3001", PORT_RANGE),
     authKey: process.env.API_AUTH_KEY || DEFAULT_API_AUTH_KEY,
     cors: {
       enabled: process.env.CORS_ENABLED !== "false",
