@@ -158,7 +158,11 @@ const network = getBitcoinNetwork(config.network);
 
 // Initialize attestation engine
 const keyProvider = createKeyProvider(config.keys);
-const engine = new AttestationEngine({ network, keyProvider });
+const engine = new AttestationEngine({
+  network,
+  keyProvider,
+  usedNonceRegistryPath: config.usedNonceRegistryPath,
+});
 await engine.initialize();
 
 // Create event announcement for payment verification

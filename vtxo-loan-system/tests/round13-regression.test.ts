@@ -4,6 +4,8 @@
  *  R13-1  a relative nonce registry path is refused, so the registry cannot
  *         depend on the working directory of the process
  *  R13-2  a port setting outside 1-65535 is refused when the config loads
+ *  R13-3  the configuration carries the registry path, so the documented
+ *         startup flow (config -> engine) works and needs an absolute path
  */
 import * as fs from "fs";
 import * as os from "os";
@@ -14,7 +16,7 @@ import { BitcoinNetworks } from "bitcoin-networks";
 import { AttestationEngine } from "../src/attestation/attestation-engine";
 import { UsedNonceRegistry } from "../src/attestation/used-nonce-registry";
 import { MockKeyProvider } from "../src/keys/key-provider";
-import { loadConfigFromEnv } from "../src/config/system-config";
+import { loadConfig, loadConfigFromEnv } from "../src/config/system-config";
 
 const MNEMONIC = "test test test test test test test test test test test junk";
 
@@ -128,5 +130,63 @@ describe("R13-2: port settings are refused outside 1-65535 when the config loads
     expect(config.api.publicPort).toBe(1);
     expect(config.api.internalPort).toBe(65535);
     expect(config.redis.port).toBe(6380);
+  });
+});
+
+describe("R13-3: the configuration carries the nonce registry path", () => {
+  const KEYS = [
+    "NETWORK",
+    "ORACLE_MODE",
+    "KEY_PROVIDER",
+    "USED_NONCE_REGISTRY_PATH",
+  ];
+  let saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved = {};
+    for (const key of KEYS) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+    process.env.NETWORK = "regtest";
+    process.env.ORACLE_MODE = "development";
+    process.env.KEY_PROVIDER = "mock";
+  });
+
+  afterEach(() => {
+    for (const key of KEYS) {
+      if (saved[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = saved[key];
+      }
+    }
+  });
+
+  it("USED_NONCE_REGISTRY_PATH is read into the configuration", () => {
+    const registryPath = path.join(tmpDir("r13-config-"), "used-nonces.json");
+    process.env.USED_NONCE_REGISTRY_PATH = registryPath;
+    expect(loadConfigFromEnv().usedNonceRegistryPath).toBe(registryPath);
+  });
+
+  it("loading refuses a missing or relative registry path", () => {
+    expect(() => loadConfig()).toThrow(/USED_NONCE_REGISTRY_PATH must be an absolute path/);
+    process.env.USED_NONCE_REGISTRY_PATH = "data/used-nonces.json";
+    expect(() => loadConfig()).toThrow(/USED_NONCE_REGISTRY_PATH must be an absolute path/);
+  });
+
+  it("the documented startup flow (config, then engine) opens the configured registry", () => {
+    const registryPath = path.join(tmpDir("r13-startup-"), "used-nonces.json");
+    process.env.USED_NONCE_REGISTRY_PATH = registryPath;
+    const config = loadConfig();
+    const engine = new AttestationEngine({
+      network: BitcoinNetworks.bitcoin_regtest,
+      keyProvider: new MockKeyProvider(MNEMONIC),
+      usedNonceRegistryPath: config.usedNonceRegistryPath,
+      developmentMode: true,
+    });
+    // The engine holds the writer lock of the configured registry.
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(/locked/);
+    engine.close();
   });
 });

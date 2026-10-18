@@ -168,7 +168,11 @@ npm run dev
 
 ### Create Loan
 ```typescript
-const engine = new AttestationEngine({ network, keyProvider });
+const engine = new AttestationEngine({
+  network,
+  keyProvider,
+  usedNonceRegistryPath: config.usedNonceRegistryPath,
+});
 await engine.initialize();
 
 const announcement = await engine.createAnnouncement(

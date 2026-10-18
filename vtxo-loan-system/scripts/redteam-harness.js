@@ -404,6 +404,7 @@ async function main() {
       monitoring: { logLevel: "info" },
       scheduler: { priceCheckInterval: 5, paymentCheckInterval: 2, announcementLookahead: 13 },
       vtxo: { defaultExitDelay: 1008, serverPublicKey: "aabb", minContractValue: 10000 },
+      usedNonceRegistryPath: "/srv/vtxo/used-nonces.json",
     };
 
     // dev-key-insecure no longer survives ORACLE_MODE=development + mainnet

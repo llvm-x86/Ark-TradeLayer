@@ -4,6 +4,8 @@
  * Centralized configuration management for the VTXO loan system.
  */
 
+import * as path from "path";
+
 import { BitcoinNetwork, BitcoinNetworks } from "bitcoin-networks";
 
 /**
@@ -162,6 +164,8 @@ export interface SystemConfig {
   scheduler: SchedulerConfig;
   /** VTXO contracts */
   vtxo: VtxoConfig;
+  /** Used-nonce registry file (USED_NONCE_REGISTRY_PATH); must be an absolute path */
+  usedNonceRegistryPath: string;
 }
 
 /**
@@ -363,6 +367,7 @@ export function loadConfigFromEnv(): SystemConfig {
     monitoring,
     scheduler,
     vtxo,
+    usedNonceRegistryPath: process.env["USED_NONCE_REGISTRY_PATH"] || "",
   };
 }
 
@@ -459,6 +464,13 @@ export function validateConfig(input: SystemConfig): string[] {
   // Validate database
   if (!config.database.uri) {
     errors.push("Database URI is required");
+  }
+
+  // Validate the nonce registry path (the registry itself refuses a relative one too)
+  if (typeof config.usedNonceRegistryPath !== "string" || !path.isAbsolute(config.usedNonceRegistryPath)) {
+    errors.push(
+      `USED_NONCE_REGISTRY_PATH must be an absolute path to the used-nonce registry file, got ${JSON.stringify(config.usedNonceRegistryPath)}`
+    );
   }
 
   // Validate VTXO

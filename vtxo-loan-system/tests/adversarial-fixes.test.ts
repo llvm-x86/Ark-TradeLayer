@@ -70,6 +70,7 @@ function makeConfig(overrides: Partial<SystemConfig> = {}): SystemConfig {
     monitoring: { logLevel: "info" },
     scheduler: { priceCheckInterval: 5, paymentCheckInterval: 2, announcementLookahead: 13 },
     vtxo: { defaultExitDelay: 1008, serverPublicKey: "aabbcc", minContractValue: 10000 },
+    usedNonceRegistryPath: "/srv/vtxo/used-nonces.json",
     ...overrides,
   };
 }
@@ -358,7 +359,12 @@ describe("fix 3: config normalization and mainnet-implied hardening", () => {
 
   it("still allows mock key custody in development on non-mainnet", async () => {
     await withEnv(
-      { KEY_PROVIDER: "mock", ORACLE_MODE: "development", NETWORK: "regtest" },
+      {
+        KEY_PROVIDER: "mock",
+        ORACLE_MODE: "development",
+        NETWORK: "regtest",
+        USED_NONCE_REGISTRY_PATH: "/srv/vtxo/used-nonces.json",
+      },
       () => {
         const config = loadConfig();
         expect(config.keys.provider).toBe("mock");
