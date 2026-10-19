@@ -172,6 +172,7 @@ const engine = new AttestationEngine({
   network,
   keyProvider,
   usedNonceRegistryPath: config.usedNonceRegistryPath,
+  usedNonceRegistryInit: config.usedNonceRegistryInit,
 });
 await engine.initialize();
 

@@ -162,6 +162,7 @@ const engine = new AttestationEngine({
   network,
   keyProvider,
   usedNonceRegistryPath: config.usedNonceRegistryPath,
+  usedNonceRegistryInit: config.usedNonceRegistryInit,
 });
 await engine.initialize();
 
@@ -337,6 +338,11 @@ k           = nonce_key + H_tag("DLC/oracle/nonce-tweak/v1", lenpfx(R_base) || l
   in-memory-only registry outside development. Reusing a `k` across two
   messages leaks the oracle key (`x = (s1 - s2) / (e1 - e2)`), so a second
   writer or a deleted/truncated history is fatal at startup, never a warning.
+  The registry is never created implicitly: a missing registry refuses to
+  start. Set `USED_NONCE_REGISTRY_INIT=1` for the first start of a signer only,
+  then unset it. To move an existing registry, move its file and its `.anchor`
+  together to `USED_NONCE_REGISTRY_PATH` with the same names; moving the file
+  alone is refused.
 
 ### Oracle Trust
 
