@@ -340,9 +340,11 @@ k           = nonce_key + H_tag("DLC/oracle/nonce-tweak/v1", lenpfx(R_base) || l
   writer or a deleted/truncated history is fatal at startup, never a warning.
   The registry is never created implicitly: a missing registry refuses to
   start. Set `USED_NONCE_REGISTRY_INIT=1` for the first start of a signer only,
-  then unset it. To move an existing registry, move its file and its `.anchor`
-  together to `USED_NONCE_REGISTRY_PATH` with the same names; moving the file
-  alone is refused.
+  then unset it. The first creation also writes a marker, `<registry>.created`.
+  While the marker exists, a missing registry is refused even with the flag:
+  restore the registry from backup, and do not re-init. To move an existing
+  registry, move its file and its `.anchor` together to `USED_NONCE_REGISTRY_PATH`
+  with the same names; moving the file alone is refused.
 
 ### Oracle Trust
 
