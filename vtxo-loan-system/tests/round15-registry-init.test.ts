@@ -11,6 +11,8 @@
  *  R15-A2-5  an interrupted first start (anchor, no registry) is finished by
  *            initialize, and a deleted history is refused even with initialize
  *  R15-A2-6  the flag is read by the configuration and passed by the engine
+ *
+ *  R15-A1    the registry path is trimmed when it is read, as the numeric settings are
  */
 import * as crypto from "crypto";
 import * as fs from "fs";
@@ -236,5 +238,43 @@ describe("R15-A2-6: the flag reaches the registry through the configuration", ()
     const engine = start();
     expect(fs.existsSync(registryPath)).toBe(true);
     engine.close();
+  });
+});
+
+describe("R15-A1: the registry path is trimmed like the numeric settings", () => {
+  const KEYS = ["NETWORK", "ORACLE_MODE", "KEY_PROVIDER", "USED_NONCE_REGISTRY_PATH", "REDIS_PORT"];
+  let saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved = {};
+    for (const key of KEYS) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+    process.env.NETWORK = "regtest";
+    process.env.ORACLE_MODE = "development";
+    process.env.KEY_PROVIDER = "mock";
+  });
+
+  afterEach(() => {
+    for (const key of KEYS) {
+      if (saved[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = saved[key];
+      }
+    }
+  });
+
+  it("surrounding whitespace is removed; the trimmed path is what the registry opens", () => {
+    const registryPath = path.join(tmpDir("r15-trim-"), "used-nonces.json");
+    process.env.USED_NONCE_REGISTRY_PATH = `  ${registryPath} \n`;
+    expect(loadConfigFromEnv().usedNonceRegistryPath).toBe(registryPath);
+    expect(() => loadConfig()).not.toThrow();
+  });
+
+  it("a numeric setting with the same padding is read the same way", () => {
+    process.env.REDIS_PORT = " 6380 ";
+    expect(loadConfigFromEnv().redis.port).toBe(6380);
   });
 });

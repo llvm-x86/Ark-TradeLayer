@@ -369,7 +369,7 @@ export function loadConfigFromEnv(): SystemConfig {
     monitoring,
     scheduler,
     vtxo,
-    usedNonceRegistryPath: process.env["USED_NONCE_REGISTRY_PATH"] || "",
+    usedNonceRegistryPath: (process.env["USED_NONCE_REGISTRY_PATH"] || "").trim(),
     usedNonceRegistryInit: registryInitEnv(),
   };
 }
