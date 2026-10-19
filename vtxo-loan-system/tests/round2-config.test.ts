@@ -29,6 +29,7 @@ function makeConfig(overrides: Partial<SystemConfig> = {}): SystemConfig {
     scheduler: { priceCheckInterval: 5, paymentCheckInterval: 2, announcementLookahead: 13 },
     vtxo: { defaultExitDelay: 1008, serverPublicKey: "aabbcc", minContractValue: 10000 },
     usedNonceRegistryPath: "/srv/vtxo/used-nonces.json",
+    usedNonceRegistryInit: true,
     ...overrides,
   };
 }

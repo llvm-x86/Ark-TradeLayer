@@ -85,6 +85,7 @@ async function main() {
     network: NETWORK,
     keyProvider,
     usedNonceRegistryPath: path.join(registryDir, "used-nonces.json"),
+    usedNonceRegistryInit: true,
     developmentMode: true,
   });
   await engine.initialize();

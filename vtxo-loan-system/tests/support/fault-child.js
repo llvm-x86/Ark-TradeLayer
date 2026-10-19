@@ -145,7 +145,7 @@ const OPS = [
 function main() {
   let registry;
   try {
-    registry = new UsedNonceRegistry({ persistPath: registryPath });
+    registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
   } catch (e) {
     emit(`REFUSED ${e.message}`);
     emit(`CALLS ${callCount}`);

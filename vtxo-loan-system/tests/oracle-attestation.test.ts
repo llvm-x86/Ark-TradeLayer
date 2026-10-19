@@ -78,6 +78,7 @@ async function makeEngine(): Promise<AttestationEngine> {
     network: BitcoinNetworks.bitcoin_regtest,
     keyProvider: new MockKeyProvider(MNEMONIC),
     usedNonceRegistryPath: tmpRegistryPath(),
+    usedNonceRegistryInit: true,
     developmentMode: true,
     trustedOraclePublicKey:
       "8eead9aaf2bb8800aae8dfe44382eac6c731c8bb2ced4a2eed807ecb7861469e",
@@ -113,6 +114,7 @@ function makeConfig(overrides: Partial<SystemConfig> = {}): SystemConfig {
     scheduler: { priceCheckInterval: 5, paymentCheckInterval: 2, announcementLookahead: 13 },
     vtxo: { defaultExitDelay: 1008, serverPublicKey: "aabbcc", minContractValue: 10000 },
     usedNonceRegistryPath: "/srv/vtxo/used-nonces.json",
+    usedNonceRegistryInit: true,
     ...overrides,
   };
 }
@@ -240,6 +242,7 @@ describe("oracle attestation core (PR suite)", () => {
       network: BitcoinNetworks.bitcoin_regtest,
       keyProvider: new MockKeyProvider(MNEMONIC),
       usedNonceRegistryPath: tmpRegistryPath(),
+      usedNonceRegistryInit: true,
       developmentMode: true,
       // no trustedOraclePublicKey
     });

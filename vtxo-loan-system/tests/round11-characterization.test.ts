@@ -54,6 +54,7 @@ async function makeEngine(registryPath: string): Promise<AttestationEngine> {
     network: BitcoinNetworks.bitcoin_regtest,
     keyProvider: new MockKeyProvider(MNEMONIC),
     usedNonceRegistryPath: registryPath,
+    usedNonceRegistryInit: true,
     developmentMode: true,
   });
   await engine.initialize();
@@ -249,7 +250,7 @@ describe("C3: announcement authentication and the maturity gate", () => {
 describe("C4: registry log and anchor formats", () => {
   it("the log holds version 3 entries with the four fields, and the anchor holds the tip", () => {
     const registryPath = tmpRegistry();
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     const r1 = "11".repeat(32);
     const r2 = "22".repeat(32);
     const m1 = "aa".repeat(32);
@@ -278,14 +279,14 @@ describe("C4: registry log and anchor formats", () => {
 
   it("the anchor of an empty history records a null tip", () => {
     const registryPath = tmpRegistry();
-    new UsedNonceRegistry({ persistPath: registryPath }).close();
+    new UsedNonceRegistry({ persistPath: registryPath, initialize: true }).close();
     const anchor = JSON.parse(fs.readFileSync(`${registryPath}.anchor`, "utf8"));
     expect(anchor).toEqual({ version: 1, tip: null });
   });
 
   it("a repeat of an identical record does not grow the log", () => {
     const registryPath = tmpRegistry();
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     registry.checkAndRecord("33".repeat(32), "event-3", "cc".repeat(32));
     registry.checkAndRecord("33".repeat(32), "event-3", "cc".repeat(32));
     registry.close();
@@ -295,7 +296,7 @@ describe("C4: registry log and anchor formats", () => {
 
   it("the lock file names its holder and is removed on close", () => {
     const registryPath = tmpRegistry();
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     const lock = JSON.parse(fs.readFileSync(`${registryPath}.lock`, "utf8"));
     expect(lock.pid).toBe(process.pid);
     expect(typeof lock.hostname).toBe("string");
@@ -316,7 +317,7 @@ describe("C5: event id and descriptor boundaries", () => {
   });
 
   it("the registry enforces the same event id rule on write", () => {
-    const registry = new UsedNonceRegistry({ persistPath: tmpRegistry() });
+    const registry = new UsedNonceRegistry({ persistPath: tmpRegistry(), initialize: true });
     const nonce = "44".repeat(32);
     const message = "dd".repeat(32);
     expect(() => registry.checkAndRecord(nonce, "x".repeat(255), message)).not.toThrow();

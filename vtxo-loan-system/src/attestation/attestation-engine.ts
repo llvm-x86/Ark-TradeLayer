@@ -160,6 +160,11 @@ export interface AttestationEngineConfig {
    */
   usedNonceRegistryPath: string | null;
   /**
+   * Creates the registry at usedNonceRegistryPath when it does not exist yet (the
+   * first start of a signer). Without it a missing registry refuses to start.
+   */
+  usedNonceRegistryInit?: boolean;
+  /**
    * Explicit development-mode marker. Only development mode may run with an
    * in-memory nonce registry; mainnet always implies production semantics.
    */
@@ -566,7 +571,10 @@ export class AttestationEngine {
       }
       this.usedNonces = new UsedNonceRegistry({ persistPath: null, allowInMemory: true });
     } else {
-      this.usedNonces = new UsedNonceRegistry({ persistPath: registryPath });
+      this.usedNonces = new UsedNonceRegistry({
+        persistPath: registryPath,
+        initialize: config.usedNonceRegistryInit === true,
+      });
     }
   }
 

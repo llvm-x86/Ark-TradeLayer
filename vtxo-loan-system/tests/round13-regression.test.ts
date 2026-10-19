@@ -36,7 +36,7 @@ describe("R13-1: a relative nonce registry path is refused", () => {
     const scratch = tmpDir("r13-relative-");
     process.chdir(scratch);
     try {
-      expect(() => new UsedNonceRegistry({ persistPath: "data/used-nonces.json" })).toThrow(
+      expect(() => new UsedNonceRegistry({ persistPath: "data/used-nonces.json", initialize: true })).toThrow(
         /absolute/
       );
       expect(fs.existsSync(path.join(scratch, "data"))).toBe(false);
@@ -56,6 +56,7 @@ describe("R13-1: a relative nonce registry path is refused", () => {
             network: BitcoinNetworks.bitcoin_regtest,
             keyProvider: new MockKeyProvider(MNEMONIC),
             usedNonceRegistryPath: "data/used-nonces.json",
+            usedNonceRegistryInit: true,
             developmentMode: true,
           })
       ).toThrow(/absolute/);
@@ -68,13 +69,13 @@ describe("R13-1: a relative nonce registry path is refused", () => {
   it("an absolute path is accepted, and the same file is found from another directory", () => {
     const registryPath = path.join(tmpDir("r13-absolute-"), "data", "used-nonces.json");
     const previous = process.cwd();
-    const first = new UsedNonceRegistry({ persistPath: registryPath });
+    const first = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     first.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
     first.close();
 
     process.chdir(os.tmpdir());
     try {
-      const restarted = new UsedNonceRegistry({ persistPath: registryPath });
+      const restarted = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
       expect(() =>
         restarted.checkAndRecord("11".repeat(32), "event-1", "bb".repeat(32))
       ).toThrow(/nonce/i);
@@ -143,6 +144,7 @@ describe("R13-3: the configuration carries the nonce registry path", () => {
     "ORACLE_MODE",
     "KEY_PROVIDER",
     "USED_NONCE_REGISTRY_PATH",
+    "USED_NONCE_REGISTRY_INIT",
   ];
   let saved: Record<string, string | undefined> = {};
 
@@ -182,11 +184,13 @@ describe("R13-3: the configuration carries the nonce registry path", () => {
   it("the documented startup flow (config, then engine) opens the configured registry", () => {
     const registryPath = path.join(tmpDir("r13-startup-"), "used-nonces.json");
     process.env.USED_NONCE_REGISTRY_PATH = registryPath;
+    process.env.USED_NONCE_REGISTRY_INIT = "1";
     const config = loadConfig();
     const engine = new AttestationEngine({
       network: BitcoinNetworks.bitcoin_regtest,
       keyProvider: new MockKeyProvider(MNEMONIC),
       usedNonceRegistryPath: config.usedNonceRegistryPath,
+      usedNonceRegistryInit: config.usedNonceRegistryInit,
       developmentMode: true,
     });
     // The engine holds the writer lock of the configured registry.
@@ -259,6 +263,7 @@ describe("R13-4: redaction names the real secret fields", () => {
       network: BitcoinNetworks.bitcoin_regtest,
       keyProvider: new MockKeyProvider(MNEMONIC),
       usedNonceRegistryPath: registryPath,
+      usedNonceRegistryInit: true,
       developmentMode: true,
     });
     try {

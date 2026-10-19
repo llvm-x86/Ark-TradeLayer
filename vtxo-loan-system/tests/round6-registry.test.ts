@@ -52,6 +52,7 @@ function newEngine(registryPath: string): AttestationEngine {
     network: BitcoinNetworks.bitcoin_regtest,
     keyProvider: new MockKeyProvider(MNEMONIC),
     usedNonceRegistryPath: registryPath,
+    usedNonceRegistryInit: true,
     developmentMode: true,
   } as any);
 }
@@ -88,7 +89,7 @@ describe("R6-1: a failed log commit followed by a new record cannot leave the lo
     const R = (i: number) => i.toString(16).padStart(2, "0").repeat(32);
     const M = (i: number) => "ab".repeat(31) + i.toString(16).padStart(2, "0");
     try {
-      const registry = new UsedNonceRegistry({ persistPath: registryPath });
+      const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
       registry.checkAndRecord(R(1), "ev-1", M(1));
 
       // The log commit for record 2 fails before its rename: record 2 stays pending.
@@ -107,7 +108,7 @@ describe("R6-1: a failed log commit followed by a new record cannot leave the lo
       nodeFs.renameSync = realRename;
     }
 
-    const restarted = new UsedNonceRegistry({ persistPath: registryPath });
+    const restarted = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     expect(restarted.get(R(2))).toEqual({ eventId: "ev-2", messageHash: M(2) });
     expect(restarted.get(R(3))).toBeUndefined();
     // Record 3 can still be recorded after the restart.
@@ -118,7 +119,7 @@ describe("R6-1: a failed log commit followed by a new record cannot leave the lo
 
 describe("R6-2: eventId must be printable ASCII (1 to 255 characters)", () => {
   it("refuses control, non-ASCII, empty and over-long event ids on write", () => {
-    const registry = new UsedNonceRegistry({ persistPath: tmpRegistry() });
+    const registry = new UsedNonceRegistry({ persistPath: tmpRegistry(), initialize: true });
     const nonce = "11".repeat(32);
     const message = "aa".repeat(32);
     for (const bad of ["bad\nid", "nul\u0000id", "café", "", "x".repeat(256), "tab\tid"]) {
@@ -130,7 +131,7 @@ describe("R6-2: eventId must be printable ASCII (1 to 255 characters)", () => {
 
   it("refuses a log whose event id is not printable ASCII (even with a valid chain)", () => {
     const registryPath = tmpRegistry();
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     registry.checkAndRecord("11".repeat(32), "ok", "aa".repeat(32));
     registry.close();
 
@@ -153,7 +154,7 @@ describe("R6-2: eventId must be printable ASCII (1 to 255 characters)", () => {
       JSON.stringify({ version: 1, tip: entry.chain }, null, 2)
     );
 
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       /malformed entry/
     );
   });
@@ -165,7 +166,7 @@ describe("R6-3: the format-version-2 refusal forbids a same-key restart", () => 
     fs.writeFileSync(registryPath, JSON.stringify({ version: 2, entries: [] }));
     let caught: unknown;
     try {
-      new UsedNonceRegistry({ persistPath: registryPath });
+      new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     } catch (e) {
       caught = e;
     }

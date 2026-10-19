@@ -71,6 +71,7 @@ function makeConfig(overrides: Partial<SystemConfig> = {}): SystemConfig {
     scheduler: { priceCheckInterval: 5, paymentCheckInterval: 2, announcementLookahead: 13 },
     vtxo: { defaultExitDelay: 1008, serverPublicKey: "aabbcc", minContractValue: 10000 },
     usedNonceRegistryPath: "/srv/vtxo/used-nonces.json",
+    usedNonceRegistryInit: true,
     ...overrides,
   };
 }
@@ -122,6 +123,7 @@ async function makeEngine(overrides: Record<string, unknown> = {}): Promise<Atte
     network: BitcoinNetworks.bitcoin_regtest,
     keyProvider: new MockKeyProvider(MNEMONIC),
     usedNonceRegistryPath: tmpPath(),
+    usedNonceRegistryInit: true,
     developmentMode: true,
     ...overrides,
   } as any);
@@ -134,9 +136,9 @@ jest.setTimeout(30_000);
 describe("fix 1: used-nonce registry is fail-closed", () => {
   it("refuses a second instance on the same file (in-process single-writer lock)", () => {
     const registryPath = tmpPath();
-    const first = new UsedNonceRegistry({ persistPath: registryPath });
+    const first = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     first.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       NonceRegistryLockError
     );
     first.close();
@@ -158,7 +160,7 @@ describe("fix 1: used-nonce registry is fail-closed", () => {
 
       // Child is alive and holding the lock: a second writer must fail at
       // startup, not silently share the file.
-      expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+      expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
         NonceRegistryLockError
       );
     } finally {
@@ -180,13 +182,13 @@ describe("fix 1: used-nonce registry is fail-closed", () => {
     expect(out).toContain("RECORDED");
 
     // The stale lock blocks startup, whatever its contents.
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       /is locked.*Locks are never taken over automatically/s
     );
 
     // After the operator removes it, history is intact and reuse is refused.
     fs.unlinkSync(`${registryPath}.lock`);
-    const restarted = new UsedNonceRegistry({ persistPath: registryPath });
+    const restarted = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     expect(restarted.get("aa".repeat(32))).toEqual({
       eventId: "event-child",
       messageHash: "bb".repeat(32),
@@ -199,18 +201,18 @@ describe("fix 1: used-nonce registry is fail-closed", () => {
 
   it("detects deletion of the registry behind the lock (history cannot be reset)", () => {
     const registryPath = tmpPath();
-    const first = new UsedNonceRegistry({ persistPath: registryPath });
+    const first = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     first.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
     first.close(); // the anchor keeps the history tip
     fs.unlinkSync(registryPath); // attacker deletes the registry
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       /is missing but its history anchor records tip/
     );
   });
 
   it("detects truncation/rewriting of the append-only log via the digest chain", () => {
     const registryPath = tmpPath();
-    const first = new UsedNonceRegistry({ persistPath: registryPath });
+    const first = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     first.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
     first.checkAndRecord("22".repeat(32), "event-2", "bb".repeat(32));
     first.checkAndRecord("33".repeat(32), "event-3", "cc".repeat(32));
@@ -220,7 +222,7 @@ describe("fix 1: used-nonce registry is fail-closed", () => {
     const tail = JSON.parse(fs.readFileSync(registryPath, "utf8"));
     tail.entries.pop();
     fs.writeFileSync(registryPath, JSON.stringify(tail));
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       /does not extend the anchored history tip/
     );
 
@@ -228,7 +230,7 @@ describe("fix 1: used-nonce registry is fail-closed", () => {
     const mid = JSON.parse(fs.readFileSync(registryPath, "utf8"));
     mid.entries[0].messageHash = "ee".repeat(32);
     fs.writeFileSync(registryPath, JSON.stringify(mid));
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       /digest-chain check/
     );
   });
@@ -243,11 +245,11 @@ describe("fix 1: used-nonce registry is fail-closed", () => {
 
   it("persists durably and survives a clean restart with history intact", () => {
     const registryPath = tmpPath();
-    const first = new UsedNonceRegistry({ persistPath: registryPath });
+    const first = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     first.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
     first.close();
 
-    const second = new UsedNonceRegistry({ persistPath: registryPath });
+    const second = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     expect(second.get("11".repeat(32))).toBeDefined();
     expect(() => second.checkAndRecord("11".repeat(32), "event-2", "bb".repeat(32))).toThrow(
       NonceReuseError
@@ -295,6 +297,7 @@ describe("fix 1: engine wiring for the nonce registry", () => {
       network: BitcoinNetworks.bitcoin_regtest,
       keyProvider: new MockKeyProvider(MNEMONIC),
       usedNonceRegistryPath: registryPath,
+      usedNonceRegistryInit: true,
       developmentMode: true,
     });
     await engine.initialize();
@@ -307,6 +310,7 @@ describe("fix 1: engine wiring for the nonce registry", () => {
           network: BitcoinNetworks.bitcoin_regtest,
           keyProvider: new MockKeyProvider(MNEMONIC),
           usedNonceRegistryPath: registryPath,
+          usedNonceRegistryInit: true,
           developmentMode: true,
         })
     ).toThrow(NonceRegistryLockError);

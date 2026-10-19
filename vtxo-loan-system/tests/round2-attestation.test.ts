@@ -43,6 +43,7 @@ async function makeEngine(registryPath: string): Promise<AttestationEngine> {
     network: BitcoinNetworks.bitcoin_regtest,
     keyProvider: new MockKeyProvider(MNEMONIC),
     usedNonceRegistryPath: registryPath,
+    usedNonceRegistryInit: true,
     developmentMode: true,
   });
   await engine.initialize();

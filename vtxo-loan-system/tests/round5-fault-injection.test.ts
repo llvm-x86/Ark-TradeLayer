@@ -121,7 +121,7 @@ function recoverAndCheck(run: ChildRun, registryPath: string): string[] {
 
   let registry: UsedNonceRegistry;
   try {
-    registry = new UsedNonceRegistry({ persistPath: registryPath });
+    registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
   } catch (e) {
     violations.push(`${run.label}: liveness: registry refused to reopen: ${(e as Error).message}`);
     return violations;

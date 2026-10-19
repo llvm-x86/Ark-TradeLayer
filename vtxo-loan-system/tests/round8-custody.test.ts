@@ -44,6 +44,7 @@ async function makeEngine(registryPath: string): Promise<AttestationEngine> {
     network: BitcoinNetworks.bitcoin_regtest,
     keyProvider: new MockKeyProvider(MNEMONIC),
     usedNonceRegistryPath: registryPath,
+    usedNonceRegistryInit: true,
     developmentMode: true,
   });
   await engine.initialize();
@@ -92,6 +93,7 @@ describe("R8-A2: key material is never printed or serialized", () => {
       network: BitcoinNetworks.bitcoin_regtest,
       keyProvider,
       usedNonceRegistryPath: tmpRegistry(),
+      usedNonceRegistryInit: true,
       developmentMode: true,
     });
     await engine.initialize();

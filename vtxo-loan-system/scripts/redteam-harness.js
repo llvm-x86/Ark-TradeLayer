@@ -93,6 +93,7 @@ async function makeEngine(overrides = {}) {
     network: BitcoinNetworks.bitcoin_regtest,
     keyProvider: new MockKeyProvider(MNEMONIC),
     usedNonceRegistryPath: tmpRegistry(),
+    usedNonceRegistryInit: true,
     developmentMode: true,
     ...overrides,
   });
@@ -273,7 +274,7 @@ async function main() {
 
       // (a) in-process second instance
       expectThrow(
-        () => new UsedNonceRegistry({ persistPath: registryPath }),
+        () => new UsedNonceRegistry({ persistPath: registryPath, initialize: true }),
         /is locked/,
         "second in-process registry was not refused"
       );
@@ -301,13 +302,13 @@ async function main() {
     const out = runCrashingChild(crashPath);
     assert(/RECORDED/.test(out), "child did not record");
     expectThrow(
-      () => new UsedNonceRegistry({ persistPath: crashPath }),
+      () => new UsedNonceRegistry({ persistPath: crashPath, initialize: true }),
       /is locked/,
       "stale lock from a crashed writer was taken over"
     );
     fs.unlinkSync(`${crashPath}.lock`);
 
-    const restarted = new UsedNonceRegistry({ persistPath: crashPath });
+    const restarted = new UsedNonceRegistry({ persistPath: crashPath, initialize: true });
     assert(restarted.get("aa".repeat(32)) !== undefined, "history lost across restart");
     expectThrow(
       () => restarted.checkAndRecord("aa".repeat(32), "other-event", "bb".repeat(32)),
@@ -320,13 +321,13 @@ async function main() {
     const truncatePath = tmpRegistry();
     runCrashingChild(truncatePath);
     fs.unlinkSync(`${truncatePath}.lock`); // operator clears the crashed writer's lock
-    const truncatable = new UsedNonceRegistry({ persistPath: truncatePath });
+    const truncatable = new UsedNonceRegistry({ persistPath: truncatePath, initialize: true });
     truncatable.close();
     const truncated = JSON.parse(fs.readFileSync(truncatePath, "utf8"));
     truncated.entries.pop();
     fs.writeFileSync(truncatePath, JSON.stringify(truncated));
     expectThrow(
-      () => new UsedNonceRegistry({ persistPath: truncatePath }),
+      () => new UsedNonceRegistry({ persistPath: truncatePath, initialize: true }),
       /does not extend the anchored history tip/,
       "tail truncation was not detected"
     );
@@ -337,7 +338,7 @@ async function main() {
     fs.unlinkSync(`${deletePath}.lock`);
     fs.unlinkSync(deletePath);
     expectThrow(
-      () => new UsedNonceRegistry({ persistPath: deletePath }),
+      () => new UsedNonceRegistry({ persistPath: deletePath, initialize: true }),
       /is missing but its history anchor records tip/,
       "registry deletion was not detected"
     );
@@ -345,7 +346,7 @@ async function main() {
     // (d) and a fresh writer is STILL refused on the tampered file: the
     // truncated history cannot be laundered into service
     expectThrow(
-      () => new UsedNonceRegistry({ persistPath: truncatePath }),
+      () => new UsedNonceRegistry({ persistPath: truncatePath, initialize: true }),
       /does not extend the anchored history tip/,
       "tampered registry came back into service"
     );
@@ -405,6 +406,7 @@ async function main() {
       scheduler: { priceCheckInterval: 5, paymentCheckInterval: 2, announcementLookahead: 13 },
       vtxo: { defaultExitDelay: 1008, serverPublicKey: "aabb", minContractValue: 10000 },
       usedNonceRegistryPath: "/srv/vtxo/used-nonces.json",
+      usedNonceRegistryInit: true,
     };
 
     // dev-key-insecure no longer survives ORACLE_MODE=development + mainnet

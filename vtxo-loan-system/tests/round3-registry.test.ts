@@ -43,7 +43,7 @@ describe("R3-1: a failed anchor write cannot let the log run ahead", () => {
   it("refuses further records while the anchor is behind, then catches up", () => {
     const registryPath = tmpRegistry();
     const anchorPath = `${registryPath}.anchor`;
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     registry.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
 
     // Make the next anchor write fail: a directory cannot be replaced by a rename.
@@ -66,7 +66,7 @@ describe("R3-1: a failed anchor write cannot let the log run ahead", () => {
     // Record 3 was refused before it was recorded (R6-1: a new record is added only
     // to a fully committed log), so the retry commits record 2 alone. Record 3 was
     // never signed and can still be recorded later.
-    const restarted = new UsedNonceRegistry({ persistPath: registryPath });
+    const restarted = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     expect(restarted.size).toBe(2);
     expect(restarted.get("33".repeat(32))).toBeUndefined();
     restarted.close();
@@ -77,7 +77,7 @@ describe("R3-2: startup adopts at most one entry beyond the anchor", () => {
   it("refuses a log that is two entries ahead of the anchor", () => {
     const registryPath = tmpRegistry();
     const anchorPath = `${registryPath}.anchor`;
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     registry.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
     const anchorAtOne = fs.readFileSync(anchorPath);
     registry.checkAndRecord("22".repeat(32), "event-2", "bb".repeat(32));
@@ -86,7 +86,7 @@ describe("R3-2: startup adopts at most one entry beyond the anchor", () => {
 
     // Roll the anchor back two commits: no crash produces this state.
     fs.writeFileSync(anchorPath, anchorAtOne);
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       /more than one entry ahead/
     );
   });
@@ -94,14 +94,14 @@ describe("R3-2: startup adopts at most one entry beyond the anchor", () => {
   it("still adopts exactly one entry beyond the anchor (crash after log commit)", () => {
     const registryPath = tmpRegistry();
     const anchorPath = `${registryPath}.anchor`;
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     registry.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
     const anchorAtOne = fs.readFileSync(anchorPath);
     registry.checkAndRecord("22".repeat(32), "event-2", "bb".repeat(32));
     registry.close();
 
     fs.writeFileSync(anchorPath, anchorAtOne);
-    const restarted = new UsedNonceRegistry({ persistPath: registryPath });
+    const restarted = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     expect(restarted.get("22".repeat(32))).toEqual({
       eventId: "event-2",
       messageHash: "bb".repeat(32),
@@ -114,14 +114,14 @@ describe("R3-3: the anchor is read without following links", () => {
   it("refuses a symlinked anchor", () => {
     const registryPath = tmpRegistry();
     const anchorPath = `${registryPath}.anchor`;
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     registry.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
     registry.close();
 
     const elsewhere = `${anchorPath}.moved`;
     fs.renameSync(anchorPath, elsewhere);
     fs.symlinkSync(elsewhere, anchorPath);
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       NonceRegistryLockError
     );
   });
@@ -146,7 +146,7 @@ describe("R3-4 / R3-5: the lock is released on clean exit and on SIGTERM", () =>
     const result = await spawnAndWait([registryPath, "exit"]);
     expect(result.out).toContain("RECORDED");
     expect(fs.existsSync(`${registryPath}.lock`)).toBe(false);
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     expect(registry.get("ee".repeat(32))).toEqual({
       eventId: "event-exit",
       messageHash: "ff".repeat(32),
@@ -170,7 +170,7 @@ describe("R3-4 / R3-5: the lock is released on clean exit and on SIGTERM", () =>
     child.kill("SIGTERM");
     expect(await exited).toBe("SIGTERM");
     expect(fs.existsSync(`${registryPath}.lock`)).toBe(false);
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     registry.close();
   });
 });
@@ -182,14 +182,15 @@ describe("R3-6: AttestationEngine.close() releases the registry lock", () => {
       network: BitcoinNetworks.bitcoin_regtest,
       keyProvider: new MockKeyProvider(MNEMONIC),
       usedNonceRegistryPath: registryPath,
+      usedNonceRegistryInit: true,
       developmentMode: true,
     } as any);
     await engine.initialize();
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       NonceRegistryLockError
     );
     engine.close();
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     registry.close();
   });
 });

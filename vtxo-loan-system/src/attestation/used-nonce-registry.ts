@@ -70,6 +70,13 @@
  *    most one entry ahead of the anchor, and a retry of a recorded nonce re-commits
  *    the anchor before it answers.
  *
+ * 9. CREATION IS EXPLICIT (load, missingRegistryError). The registry, its anchor
+ *    and the registry directory are created only with the `initialize` option
+ *    (USED_NONCE_REGISTRY_INIT=1). Without it a missing registry refuses to start,
+ *    so moving the configured path to an empty location cannot silently abandon
+ *    the old history. With it, a registry is created only when there is no history
+ *    yet, and an existing registry or anchor is never emptied or replaced.
+ *
  * LIMITS (not enforced here):
  *  - The anchor is unkeyed. Whoever can write the registry directory can rewrite
  *    the log and the anchor together, or delete both, and reset the history. The
@@ -209,6 +216,14 @@ export interface UsedNonceRegistryOptions {
    * development-mode attestation engine sets this.
    */
   allowInMemory?: boolean;
+  /**
+   * Creates an empty registry (and its anchor) when none exists at persistPath.
+   * This is the first start of a signer (USED_NONCE_REGISTRY_INIT=1), not a
+   * default: a missing registry refuses to start without it. It never empties or
+   * replaces an existing registry; with a registry or an anchor present it changes
+   * nothing.
+   */
+  initialize?: boolean;
 }
 
 /**
@@ -252,8 +267,9 @@ export class UsedNonceRegistry {
       return;
     }
 
+    const initialize = options.initialize === true;
     try {
-      this.registryPath = canonicalRegistryPath(requested);
+      this.registryPath = canonicalRegistryPath(requested, initialize);
       this.anchorPath = `${this.registryPath}.anchor`;
       // Single acquisition point for the writer lock.
       this.lock = acquireLock(this.registryPath);
@@ -263,7 +279,7 @@ export class UsedNonceRegistry {
     heldInstances.add(this);
     installShutdownHooks();
     try {
-      this.load();
+      this.load(initialize);
       // load() leaves the in-memory log equal to the verified on-disk log.
       this.committedTip = this.tip();
     } catch (e) {
@@ -410,45 +426,45 @@ export class UsedNonceRegistry {
    * Verifies the stored history against the anchor, and adopts a strict
    * extension of the anchor (see guarantee 4 in the module comment).
    */
-  private load(): void {
+  private load(initialize: boolean): void {
     const registry = this.registryPath!;
     const anchor = readAnchor(this.anchorPath!);
     const logText = readSingleLinkFile(registry);
-    const registryExists = logText !== null;
 
-    if (logText !== null) {
-      for (const entry of parseVerifiedLog(logText, registry)) {
-        this.entries.set(entry.nonceId, { eventId: entry.eventId, messageHash: entry.messageHash });
-        this.log.push(entry);
-      }
-    }
-
-    if (anchor === null) {
-      if (this.log.length > 0) {
-        throw new NonceRegistryLockError(
-          `UsedNonceRegistry: ${registry} holds nonce history but its anchor ${this.anchorPath} ` +
-            `is missing. Refusing to start: the anchor is what detects truncation. If this ` +
-            `registry predates the anchor file, create ${this.anchorPath} containing ` +
-            `{"version": ${ANCHOR_FORMAT_VERSION}, "tip": "<chain of the last entry>"} after ` +
-            `verifying the log, then restart.`
-        );
-      }
-      // No history yet (first start, or a log without records): establish the
-      // anchor before any commit, so that a crash during the first commit
-      // cannot look like a deleted anchor.
-      this.commitFile(this.anchorPath!, anchorBody(null));
-      return;
-    }
-
-    if (!registryExists) {
-      if (anchor.tip !== null) {
+    if (logText === null) {
+      if (anchor !== null && anchor.tip !== null) {
         throw new NonceRegistryLockError(
           `UsedNonceRegistry: ${registry} is missing but its history anchor records tip ` +
             `${anchor.tip}. The used-nonce history was deleted; refusing to start (a fresh ` +
             `registry would reuse nonces and leak the oracle key).`
         );
       }
+      if (!initialize) {
+        throw missingRegistryError(registry);
+      }
+      // The first start, or one that stopped after creating the anchor. The anchor
+      // is written first, so a registry never exists without its anchor.
+      if (anchor === null) {
+        this.commitFile(this.anchorPath!, anchorBody(null));
+      }
+      this.commitFile(registry, logBody([]));
       return;
+    }
+
+    for (const entry of parseVerifiedLog(logText, registry)) {
+      this.entries.set(entry.nonceId, { eventId: entry.eventId, messageHash: entry.messageHash });
+      this.log.push(entry);
+    }
+
+    if (anchor === null) {
+      const tipHint = this.log.length > 0 ? '"<chain of the last entry>"' : "null";
+      throw new NonceRegistryLockError(
+        `UsedNonceRegistry: ${registry} exists but its history anchor ${this.anchorPath} is ` +
+          `missing. Refusing to start: the anchor is what detects truncation. If this registry ` +
+          `predates the anchor file, create ${this.anchorPath} containing ` +
+          `{"version": ${ANCHOR_FORMAT_VERSION}, "tip": ${tipHint}} after verifying the log, ` +
+          `then restart. Otherwise restore the anchor from backup.`
+      );
     }
 
     const tipIndex =
@@ -498,9 +514,7 @@ export class UsedNonceRegistry {
       this.commitAnchor();
     }
     if (this.uncommitted) {
-      const payload: PersistedShape = { version: LOG_FORMAT_VERSION, entries: this.log };
-      const body = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
-      this.commitFile(this.registryPath, body, () => {
+      this.commitFile(this.registryPath, logBody(this.log), () => {
         // The rename is the commit point. If the directory fsync below fails,
         // the new log is still on disk, so the anchor must be treated as stale.
         this.uncommitted = false;
@@ -579,12 +593,12 @@ function chainDigest(
 }
 
 /**
- * The one place the registry path is resolved. Refuses a relative path, creates
- * the parent directory, and resolves the path to its canonical form. Every
- * spelling of one file (symlinks, `..`, `.`) maps to the same string, so it
- * yields one lock.
+ * The one place the registry path is resolved. Refuses a relative path and, unless
+ * initialize is set, a missing parent directory; with initialize it creates the
+ * parent. It resolves the path to its canonical form. Every spelling of one file
+ * (symlinks, `..`, `.`) maps to the same string, so it yields one lock.
  */
-function canonicalRegistryPath(requested: string): string {
+function canonicalRegistryPath(requested: string, initialize: boolean): string {
   if (!path.isAbsolute(requested)) {
     throw new NonceRegistryLockError(
       `UsedNonceRegistry: persistPath must be an absolute path, got ${JSON.stringify(requested)}. ` +
@@ -592,8 +606,11 @@ function canonicalRegistryPath(requested: string): string {
         "directory would open an empty registry and could re-sign a nonce."
     );
   }
-  fs.mkdirSync(path.dirname(requested), { recursive: true });
   const absolute = path.resolve(requested);
+  if (!initialize && lstatOrNull(path.dirname(absolute)) === null) {
+    throw missingRegistryError(absolute);
+  }
+  fs.mkdirSync(path.dirname(absolute), { recursive: true });
   try {
     return fs.realpathSync.native(absolute);
   } catch (e) {
@@ -829,6 +846,28 @@ function readAnchor(anchorPath: string): { tip: string | null } | null {
 function anchorBody(tip: string | null): Buffer {
   const anchor: AnchorShape = { version: ANCHOR_FORMAT_VERSION, tip };
   return Buffer.from(JSON.stringify(anchor, null, 2), "utf8");
+}
+
+function logBody(entries: LogEntry[]): Buffer {
+  const payload: PersistedShape = { version: LOG_FORMAT_VERSION, entries };
+  return Buffer.from(JSON.stringify(payload, null, 2), "utf8");
+}
+
+/**
+ * Refusal for a registry that does not exist. A missing registry is an empty
+ * history, and an empty history signs nonces again, so it is never created
+ * without the explicit initialize option.
+ */
+function missingRegistryError(registryPath: string): NonceRegistryLockError {
+  return new NonceRegistryLockError(
+    `UsedNonceRegistry: ${registryPath} does not exist. Refusing to start: a missing registry ` +
+      `is an empty history, and an empty history signs nonces again. If this signer has run ` +
+      `before, its registry is at another path (the default before the path was required was ` +
+      `data/used-nonces.json, relative to the working directory). Move the registry file and ` +
+      `its anchor ${registryPath}.anchor together to this path, with these names, then restart. ` +
+      `Do not move the registry alone, and do not leave an empty file in its place. If this ` +
+      `signer has never had a registry, set USED_NONCE_REGISTRY_INIT=1 for one start, then unset it.`
+  );
 }
 
 /**

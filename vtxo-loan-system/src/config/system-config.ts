@@ -166,6 +166,8 @@ export interface SystemConfig {
   vtxo: VtxoConfig;
   /** Used-nonce registry file (USED_NONCE_REGISTRY_PATH); must be an absolute path */
   usedNonceRegistryPath: string;
+  /** Create the registry on this start if none exists (USED_NONCE_REGISTRY_INIT=1) */
+  usedNonceRegistryInit: boolean;
 }
 
 /**
@@ -368,7 +370,22 @@ export function loadConfigFromEnv(): SystemConfig {
     scheduler,
     vtxo,
     usedNonceRegistryPath: process.env["USED_NONCE_REGISTRY_PATH"] || "",
+    usedNonceRegistryInit: registryInitEnv(),
   };
+}
+
+/**
+ * USED_NONCE_REGISTRY_INIT: 1 creates the nonce registry on this start when none
+ * exists at its path; unset or 0 does not. Any other value is refused.
+ */
+function registryInitEnv(): boolean {
+  const text = (process.env["USED_NONCE_REGISTRY_INIT"] || "0").trim();
+  if (text !== "0" && text !== "1") {
+    throw new Error(
+      `USED_NONCE_REGISTRY_INIT must be 1 or 0, got ${JSON.stringify(process.env["USED_NONCE_REGISTRY_INIT"])}`
+    );
+  }
+  return text === "1";
 }
 
 /**

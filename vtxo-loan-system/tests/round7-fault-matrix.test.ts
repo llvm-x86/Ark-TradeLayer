@@ -187,7 +187,7 @@ function recoveryHintOf(message: string): string | null {
 function checkLockRefusal(registryPath: string, label: string): string[] {
   const violations: string[] = [];
   try {
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     registry.close();
     violations.push(`${label}: a left-behind lock did not refuse the start`);
   } catch (e) {
@@ -208,7 +208,7 @@ function checkRecovered(registryPath: string, signed: Signed[], label: string): 
   const violations: string[] = [];
   let registry: UsedNonceRegistry;
   try {
-    registry = new UsedNonceRegistry({ persistPath: registryPath });
+    registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
   } catch (e) {
     return [`${label}: liveness: a clean start refused: ${(e as Error).message}`];
   }
@@ -263,7 +263,7 @@ function restartMatrix(stateDir: string, workDir: string, signed: Signed[], labe
   const probeFile = copyState(stateDir, path.join(workDir, "probe"));
   const probe = instrument(null);
   try {
-    new UsedNonceRegistry({ persistPath: probeFile }).close();
+    new UsedNonceRegistry({ persistPath: probeFile, initialize: true }).close();
   } finally {
     probe.restore();
   }
@@ -278,7 +278,7 @@ function restartMatrix(stateDir: string, workDir: string, signed: Signed[], labe
       let opened: UsedNonceRegistry | null = null;
       let openError: unknown = null;
       try {
-        opened = new UsedNonceRegistry({ persistPath: file });
+        opened = new UsedNonceRegistry({ persistPath: file, initialize: true });
       } catch (e) {
         openError = e;
       } finally {
@@ -457,7 +457,7 @@ describe("R7 recovery hint: the rm command quotes the lock path for the shell", 
       fs.writeFileSync(lockPathOf(registryPath), "{}");
       let message = "";
       try {
-        new UsedNonceRegistry({ persistPath: registryPath });
+        new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
       } catch (e) {
         message = (e as Error).message;
       }

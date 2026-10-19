@@ -38,6 +38,7 @@ function newEngine(registryPath: string): AttestationEngine {
     network: BitcoinNetworks.bitcoin_regtest,
     keyProvider: new MockKeyProvider(MNEMONIC),
     usedNonceRegistryPath: registryPath,
+    usedNonceRegistryInit: true,
     developmentMode: true,
   } as any);
 }
@@ -85,7 +86,7 @@ describe("R5-2: format version 2 is refused", () => {
   it("refuses a version-2 log with the rotation instruction", () => {
     const registryPath = tmpRegistry();
     fs.writeFileSync(registryPath, JSON.stringify({ version: 2, entries: [] }));
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       /format-version-2 registry[\s\S]*rotate it/
     );
   });
@@ -93,7 +94,7 @@ describe("R5-2: format version 2 is refused", () => {
   it("refuses an unknown format version", () => {
     const registryPath = tmpRegistry();
     fs.writeFileSync(registryPath, JSON.stringify({ version: 9, entries: [] }));
-    expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(
+    expect(() => new UsedNonceRegistry({ persistPath: registryPath, initialize: true })).toThrow(
       NonceRegistryLockError
     );
   });
@@ -138,7 +139,7 @@ describe("R5-3b: a 31-bit index collision across two events cannot share a nonce
 
 describe("R5-4: the registry rejects malformed identifiers", () => {
   it("refuses a nonceId or messageHash that is not 32-byte lowercase hex", () => {
-    const registry = new UsedNonceRegistry({ persistPath: tmpRegistry() });
+    const registry = new UsedNonceRegistry({ persistPath: tmpRegistry(), initialize: true });
     expect(() => registry.checkAndRecord("aa", "event", "bb".repeat(32))).toThrow(
       /32-byte lowercase hex/
     );
@@ -219,7 +220,7 @@ describe("R5-6: a failed directory fsync then a failed anchor write cannot leave
       return realRename(from, to);
     };
     try {
-      const registry = new UsedNonceRegistry({ persistPath: registryPath });
+      const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
       dirFsyncArmed = true;
       expect(() => registry.checkAndRecord("11".repeat(32), "e1", "aa".repeat(32))).toThrow(
         /injected EIO/
@@ -236,7 +237,7 @@ describe("R5-6: a failed directory fsync then a failed anchor write cannot leave
       nodeFs.renameSync = realRename;
     }
 
-    const restarted = new UsedNonceRegistry({ persistPath: registryPath });
+    const restarted = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     expect(restarted.get("11".repeat(32))).toEqual({ eventId: "e1", messageHash: "aa".repeat(32) });
     restarted.close();
   });

@@ -144,6 +144,7 @@ describe("R11-3: a malformed pinned oracle key is refused at construction", () =
       network: BitcoinNetworks.bitcoin_regtest,
       keyProvider,
       usedNonceRegistryPath: registryPath,
+      usedNonceRegistryInit: true,
       developmentMode: true,
     };
     expect(
@@ -162,11 +163,13 @@ describe("R11-3: a malformed pinned oracle key is refused at construction", () =
     const asBuffer = new AttestationEngine({
       ...base,
       usedNonceRegistryPath: path.join(dir, "a.json"),
+      usedNonceRegistryInit: true,
       trustedOraclePublicKey: Buffer.alloc(32, 7),
     });
     const asHex = new AttestationEngine({
       ...base,
       usedNonceRegistryPath: path.join(dir, "b.json"),
+      usedNonceRegistryInit: true,
       trustedOraclePublicKey: "07".repeat(32),
     });
     asBuffer.close();
@@ -178,7 +181,7 @@ describe("R11-4: the anchor is single-link checked on every commit", () => {
   it("a hard link to the anchor refuses the commit: nothing is signed", () => {
     const registryPath = path.join(tmpDir("r11-anchor-"), "used-nonces.json");
     const anchorPath = `${registryPath}.anchor`;
-    const registry = new UsedNonceRegistry({ persistPath: registryPath });
+    const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     registry.checkAndRecord("11".repeat(32), "event-1", "aa".repeat(32));
 
     const alias = `${anchorPath}.alias`;

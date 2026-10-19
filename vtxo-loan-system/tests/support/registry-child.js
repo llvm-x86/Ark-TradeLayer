@@ -33,7 +33,7 @@ try {
     }
   }
 
-  const registry = new UsedNonceRegistry({ persistPath: registryPath });
+  const registry = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
 
   if (mode === "race") {
     registry.checkAndRecord("dd".repeat(32), `race-${process.pid}`, "ee".repeat(32));
