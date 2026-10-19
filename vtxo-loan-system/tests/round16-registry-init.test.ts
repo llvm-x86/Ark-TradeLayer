@@ -10,6 +10,8 @@
  *  R16-F5-4  a registry that predates the marker gets one on its next start, so
  *            the same loss is then refused
  *  R16-F5-5  a restart without the flag keeps the history and the marker
+ *  R16-F7-1  an interrupted first start (anchor, no registry) is refused without
+ *            the flag with a message that names the flag, not a moved registry
  */
 import * as fs from "fs";
 import * as os from "os";
@@ -103,5 +105,21 @@ describe("R16-F5: the init flag creates a registry once", () => {
     restarted.close();
 
     expect(fs.existsSync(markerOf(registryPath))).toBe(true);
+  });
+});
+
+describe("R16-F7: an interrupted first start names the flag", () => {
+  it("R16-F7-1: an anchor with no registry is refused without the flag, and the message names the flag", () => {
+    const registryPath = path.join(tmpDir("r16-interrupted-"), "used-nonces.json");
+    new UsedNonceRegistry({ persistPath: registryPath, initialize: true }).close();
+    fs.unlinkSync(registryPath);
+    fs.rmSync(markerOf(registryPath), { force: true });
+
+    const error = startError({ persistPath: registryPath });
+
+    expect(error.message).toMatch(/interrupted first start/);
+    expect(error.message).toMatch(/USED_NONCE_REGISTRY_INIT=1/);
+    expect(error.message).not.toMatch(/at another path/);
+    expect(fs.existsSync(lockOf(registryPath))).toBe(false);
   });
 });

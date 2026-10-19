@@ -454,7 +454,9 @@ export class UsedNonceRegistry {
         throw lostRegistryError(registry, this.markerPath!);
       }
       if (!initialize) {
-        throw missingRegistryError(registry);
+        throw anchor === null
+          ? missingRegistryError(registry)
+          : interruptedStartError(registry, this.anchorPath!);
       }
       // The first start, or one that stopped after creating the anchor. The anchor
       // is written first, so a registry never exists without its anchor, and the
@@ -891,6 +893,19 @@ function missingRegistryError(registryPath: string): NonceRegistryLockError {
       `its anchor ${registryPath}.anchor together to this path, with these names, then restart. ` +
       `Do not move the registry alone, and do not leave an empty file in its place. If this ` +
       `signer has never had a registry, set USED_NONCE_REGISTRY_INIT=1 for one start, then unset it.`
+  );
+}
+
+/**
+ * Refusal for an anchor with no registry and no recorded history. The first start
+ * stopped after it wrote the anchor, and only the init flag finishes that start.
+ */
+function interruptedStartError(registryPath: string, anchorPath: string): NonceRegistryLockError {
+  return new NonceRegistryLockError(
+    `UsedNonceRegistry: ${registryPath} does not exist, but ${anchorPath} does and records no ` +
+      `history. This is an interrupted first start. Set USED_NONCE_REGISTRY_INIT=1 for one start ` +
+      `to create the registry, then unset it. If the registry was moved to another path, move it ` +
+      `back to this path, with its anchor, instead.`
   );
 }
 
