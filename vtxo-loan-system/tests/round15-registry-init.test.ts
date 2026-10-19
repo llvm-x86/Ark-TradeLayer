@@ -158,7 +158,9 @@ describe("R15-A2-5: an interrupted first start is finished by initialize only", 
     const registryPath = path.join(tmpDir("r15-interrupted-"), "used-nonces.json");
     const created = new UsedNonceRegistry({ persistPath: registryPath, initialize: true });
     created.close();
+    // The state of a start that stopped after the anchor: no registry, no marker.
     fs.unlinkSync(registryPath);
+    fs.unlinkSync(`${registryPath}.created`);
 
     expect(() => new UsedNonceRegistry({ persistPath: registryPath })).toThrow(/does not exist/);
     expect(fs.existsSync(layout(registryPath).lock)).toBe(false);

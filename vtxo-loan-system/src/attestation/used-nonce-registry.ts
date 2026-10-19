@@ -70,12 +70,17 @@
  *    most one entry ahead of the anchor, and a retry of a recorded nonce re-commits
  *    the anchor before it answers.
  *
- * 9. CREATION IS EXPLICIT (load, missingRegistryError). The registry, its anchor
- *    and the registry directory are created only with the `initialize` option
- *    (USED_NONCE_REGISTRY_INIT=1). Without it a missing registry refuses to start,
- *    so moving the configured path to an empty location cannot silently abandon
- *    the old history. With it, a registry is created only when there is no history
- *    yet, and an existing registry or anchor is never emptied or replaced.
+ * 9. CREATION IS EXPLICIT AND ONE-SHOT (load, missingRegistryError,
+ *    lostRegistryError). The registry, its anchor and the registry directory are
+ *    created only with the `initialize` option (USED_NONCE_REGISTRY_INIT=1). Without
+ *    it a missing registry refuses to start, so moving the configured path to an
+ *    empty location cannot silently abandon the old history. With it, a registry is
+ *    created only when there is no history yet, and an existing registry or anchor
+ *    is never emptied or replaced. The first creation then writes a marker,
+ *    `<registry>.created`, after the registry, and every later start that finds the
+ *    registry writes it if it is missing. A registry that is missing while its
+ *    marker exists is refused even with `initialize`: the history was lost, and a
+ *    flag left set from the first start must not start a fresh one.
  *
  * LIMITS (not enforced here):
  *  - The anchor is unkeyed. Whoever can write the registry directory can rewrite
@@ -91,6 +96,9 @@
  *    where the directory cannot be fsynced cannot host a registry.
  *  - Upgrading from a version with no anchor file: the start is refused. The
  *    error message gives the anchor format to create by hand from the log tip.
+ *  - The marker of guarantee 9 is unkeyed like the anchor. Whoever can delete the
+ *    registry directory can delete the marker with the rest; the marker only stops a
+ *    leftover init flag from starting a fresh history after an ordinary deletion.
  *
  * 6. NO IN-MEMORY-ONLY MODE OUTSIDE DEVELOPMENT. `persistPath: null` is only
  *    accepted with an explicit `allowInMemory: true` opt-in (the attestation
@@ -236,6 +244,7 @@ export class UsedNonceRegistry {
   /** Canonical (realpath) registry path; null in in-memory mode */
   private readonly registryPath: string | null;
   private readonly anchorPath: string | null;
+  private readonly markerPath: string | null;
   private lock: HeldLock | null = null;
   /** True while in-memory records may not yet be durably committed */
   private uncommitted = false;
@@ -264,6 +273,7 @@ export class UsedNonceRegistry {
       }
       this.registryPath = null;
       this.anchorPath = null;
+      this.markerPath = null;
       return;
     }
 
@@ -271,6 +281,7 @@ export class UsedNonceRegistry {
     try {
       this.registryPath = canonicalRegistryPath(requested, initialize);
       this.anchorPath = `${this.registryPath}.anchor`;
+      this.markerPath = `${this.registryPath}.created`;
       // Single acquisition point for the writer lock.
       this.lock = acquireLock(this.registryPath);
     } catch (e) {
@@ -439,15 +450,20 @@ export class UsedNonceRegistry {
             `registry would reuse nonces and leak the oracle key).`
         );
       }
+      if (lstatOrNull(this.markerPath!) !== null) {
+        throw lostRegistryError(registry, this.markerPath!);
+      }
       if (!initialize) {
         throw missingRegistryError(registry);
       }
       // The first start, or one that stopped after creating the anchor. The anchor
-      // is written first, so a registry never exists without its anchor.
+      // is written first, so a registry never exists without its anchor, and the
+      // marker last, so an interrupted start leaves no marker behind.
       if (anchor === null) {
         this.commitFile(this.anchorPath!, anchorBody(null));
       }
       this.commitFile(registry, logBody([]));
+      this.ensureMarker();
       return;
     }
 
@@ -491,6 +507,7 @@ export class UsedNonceRegistry {
       // exactly one entry past the anchored history. Accept it and advance the anchor.
       this.commitFile(this.anchorPath!, anchorBody(this.tip()));
     }
+    this.ensureMarker();
   }
 
   // ------------------------------------------------------------------
@@ -531,6 +548,13 @@ export class UsedNonceRegistry {
   private commitAnchor(): void {
     this.commitFile(this.anchorPath!, anchorBody(this.committedTip));
     this.anchorStale = false;
+  }
+
+  /** Records that a registry was created at this path, if the marker is not there yet */
+  private ensureMarker(): void {
+    if (lstatOrNull(this.markerPath!) === null) {
+      this.commitFile(this.markerPath!, Buffer.from("a registry was created at this path\n", "utf8"));
+    }
   }
 
   /**
@@ -867,6 +891,20 @@ function missingRegistryError(registryPath: string): NonceRegistryLockError {
       `its anchor ${registryPath}.anchor together to this path, with these names, then restart. ` +
       `Do not move the registry alone, and do not leave an empty file in its place. If this ` +
       `signer has never had a registry, set USED_NONCE_REGISTRY_INIT=1 for one start, then unset it.`
+  );
+}
+
+/**
+ * Refusal for a registry that is missing while its marker says one was created here.
+ * The history was lost, so the init flag does not apply: a fresh registry would sign
+ * nonces again.
+ */
+function lostRegistryError(registryPath: string, markerPath: string): NonceRegistryLockError {
+  return new NonceRegistryLockError(
+    `UsedNonceRegistry: ${registryPath} is missing, but ${markerPath} shows that a registry was ` +
+      `created at this path. The used-nonce history was deleted. To recover, restore the registry ` +
+      `from backup, with its anchor, then restart; do not re-init. A fresh registry would reuse ` +
+      `nonces and leak the oracle key, so the init flag does not help here.`
   );
 }
 
