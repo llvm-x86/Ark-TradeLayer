@@ -43,6 +43,14 @@ contract CollateralizedLoan(
   bytes32 repaymentDescriptorHash,
   bytes32 priceDescriptorHash,
   int oracleMaturity,
+
+  // The nonce point R each event's announcement committed to (the x-only
+  // announcement.noncePoints[0] of a binary event). An attestation counts
+  // only with that R, so one outcome per event is enforced here: a second
+  // outcome under the same R reveals the oracle key, and one under any other
+  // R is refused.
+  bytes32 repaymentNonceR,
+  bytes32 priceNonceR,
   
   // Amounts and thresholds
   int principalAmount,
@@ -68,7 +76,7 @@ contract CollateralizedLoan(
     // Verify oracle attests to full repayment
     bytes32 attestationHash = sha256(oracleAttestation);
     require(
-      verifyOracleAttestation(oracleAttestation, repaymentOracleId, repaymentDescriptorHash, oracleMaturity, "paid"),
+      verifyOracleAttestation(oracleAttestation, repaymentOracleId, repaymentDescriptorHash, oracleMaturity, repaymentNonceR, "paid"),
       "Oracle must confirm payment"
     );
     
@@ -100,7 +108,7 @@ contract CollateralizedLoan(
   ) {
     // Verify payment confirmation
     require(
-      verifyOracleAttestation(oracleAttestation, repaymentOracleId, repaymentDescriptorHash, oracleMaturity, "paid"),
+      verifyOracleAttestation(oracleAttestation, repaymentOracleId, repaymentDescriptorHash, oracleMaturity, repaymentNonceR, "paid"),
       "Oracle must confirm payment"
     );
     
@@ -150,7 +158,7 @@ contract CollateralizedLoan(
   ) {
     // Verify oracle attests that price hit liquidation threshold
     require(
-      verifyOracleAttestation(priceAttestation, priceOracleId, priceDescriptorHash, oracleMaturity, "hit"),
+      verifyOracleAttestation(priceAttestation, priceOracleId, priceDescriptorHash, oracleMaturity, priceNonceR, "hit"),
       "Liquidation threshold not reached"
     );
     
@@ -247,6 +255,7 @@ contract CollateralizedLoan(
     bytes32 eventId,
     bytes32 expectedDescriptorHash,
     int expectedMaturity,
+    bytes32 expectedNonceR,
     bytes expectedOutcome
   ) returns (bool) {
     // Parse attestation structure
@@ -266,6 +275,12 @@ contract CollateralizedLoan(
     
     // Verify outcome matches expected
     if (outcome != expectedOutcome) return false;
+
+    // The signature's nonce point must be the announced one. A BIP-340
+    // signature is R.x(32) || s(32); checkSchnorrSig alone accepts any R, so
+    // without this an oracle could sign a second outcome under a fresh nonce
+    // without revealing its key.
+    if (signature.split(32)[0] != expectedNonceR) return false;
     
     // Verify oracle signature over the v1 attestation message.
     //

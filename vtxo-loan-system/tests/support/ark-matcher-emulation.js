@@ -97,11 +97,49 @@ function arkAttestationBlob(fields, signature) {
   ]);
 }
 
+/**
+ * The matcher's verifyOracleAttestation / verifyRepayment: parses the blob and accepts it only for the pinned event
+ * id, descriptor, maturity and outcome, with the pinned announced nonce point R as the signature's first 32 bytes,
+ * and a valid BIP-340 signature by the oracle key. checkSchnorrSig alone accepts any R, so the R pin is what keeps
+ * a second outcome under a fresh nonce from counting.
+ *
+ * `schnorrVerify(pubkeyXonlyHex, messageHashHex, signatureHex) => boolean` is passed in, so this module still
+ * shares no code with src.
+ *
+ * @param {Buffer} blob
+ * @param {{eventIdHash: Buffer, oracleKeyXonly: Buffer, descriptorHash: Buffer, maturityTime: number,
+ *          outcome: Buffer, nonceR: Buffer}} pinned
+ * @param {(pubkey: string, message: string, signature: string) => boolean} schnorrVerify
+ * @returns {boolean}
+ */
+function arkVerifyOracleAttestation(blob, pinned, schnorrVerify) {
+  if (blob.length < 32 + 32 + 8 + 64) return false;
+  const attestedEventId = blob.subarray(0, 32);
+  const descriptorHash = blob.subarray(32, 64);
+  const maturityTime = blob.subarray(64, 72);
+  const outcome = blob.subarray(72, blob.length - 64);
+  const signature = blob.subarray(blob.length - 64);
+  if (!attestedEventId.equals(pinned.eventIdHash)) return false;
+  if (!descriptorHash.equals(pinned.descriptorHash)) return false;
+  if (!maturityTime.equals(u64be(pinned.maturityTime))) return false;
+  if (!outcome.equals(pinned.outcome)) return false;
+  if (!signature.subarray(0, 32).equals(pinned.nonceR)) return false;
+  const messageHash = arkAttestationMessageHash({
+    eventIdHash: attestedEventId,
+    oracleKeyXonly: pinned.oracleKeyXonly,
+    descriptorHash,
+    maturityTime: pinned.maturityTime,
+    outcome,
+  });
+  return schnorrVerify(pinned.oracleKeyXonly.toString("hex"), messageHash.toString("hex"), signature.toString("hex"));
+}
+
 module.exports = {
   ATTESTATION_TAG,
   arkAttestationMessage,
   arkAttestationMessageHash,
   arkAttestationBlob,
+  arkVerifyOracleAttestation,
   arkEventIdHash,
   lenpfx,
   sha256,

@@ -950,6 +950,20 @@ export class AttestationEngine {
       // await, so no other event-loop callback (including a signal handler) can
       // run between a durable record and the signature it authorizes.
       const { k, R } = await this.deriveSigningNonce(announcement.eventId, i);
+      // The signature must carry the nonce point announced for this index. Contracts pin
+      // announcement.noncePoints[i], and the registry, keyed by R, can only keep the oracle key
+      // safe for the nonce a second outcome would have to reuse. An engine whose nonce derivation
+      // differs from the one that announced (another noncePurpose, key path or seed behind the
+      // same oracle key) would otherwise sign under an unannounced R: an outcome no announced R
+      // commits to, and a second outcome for the event that reveals nothing. Refused before
+      // anything is recorded.
+      const announcedR = announcement.noncePoints[i];
+      if (!Buffer.isBuffer(announcedR) || !announcedR.equals(R)) {
+        throw new Error(
+          `Refusing to attest event ${announcement.eventId}: the nonce derived for index ${i} is not ` +
+            `the announced nonce point`
+        );
+      }
       this.usedNonces.checkAndRecord(
         R.toString("hex"),
         announcement.eventId,

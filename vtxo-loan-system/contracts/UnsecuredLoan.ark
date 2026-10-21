@@ -34,6 +34,12 @@ contract UnsecuredLoan(
   // maturity are signed alongside the outcome, so the loan must pin them)
   bytes32 repaymentDescriptorHash,
   int repaymentMaturity,
+
+  // The nonce point R the repayment announcement committed to (the x-only
+  // announcement.noncePoints[0] of the binary event). An attestation counts
+  // only with that R: a second outcome under it reveals the oracle key, and
+  // one under any other R is refused.
+  bytes32 repaymentNonceR,
   
   // Amounts
   int principalAmount,
@@ -257,6 +263,9 @@ contract UnsecuredLoan(
     if (descriptorHash != expectedDescriptorHash) return false;
     if (maturityTime != uint64be(expectedMaturity)) return false;
     if (outcome != expectedOutcome) return false;
+    // The signature's nonce point (R.x, its first 32 bytes) must be the
+    // announced one: checkSchnorrSig alone accepts any R.
+    if (signature.split(32)[0] != repaymentNonceR) return false;
     
     // v1 attestation message — MUST match the off-chain canonical
     // serialization byte-for-byte (see
